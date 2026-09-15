@@ -1,4 +1,8 @@
+/* @vitest-environment jsdom */
+
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+process.env.VITE_CONVEX_URL = "https://example.invalid";
 
 const redirectMock = vi.fn((options: unknown) => ({ redirect: options }));
 
@@ -14,8 +18,8 @@ type RedirectRoute = {
   };
 };
 
-async function loadRoute(path: string): Promise<RedirectRoute> {
-  return ((await import(path)) as { Route: RedirectRoute }).Route;
+async function loadRoute(importPath: string): Promise<RedirectRoute> {
+  return ((await import(importPath)) as { Route: RedirectRoute }).Route;
 }
 
 describe("scoped plugin route redirects", () => {

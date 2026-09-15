@@ -89,7 +89,7 @@ export function formatShortTimestamp(value: number) {
 
 export function formatWholeNumber(value: number | null | undefined) {
   if (typeof value !== "number" || !Number.isFinite(value)) return "—";
-  return new Intl.NumberFormat().format(Math.round(value));
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Math.round(value));
 }
 
 export function formatRatio(value: number | null | undefined) {

@@ -6,6 +6,9 @@ import { getFunctionName } from "convex/server";
 import type { AnchorHTMLAttributes, ComponentType, ReactNode } from "react";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+process.env.VITE_CONVEX_URL = "https://example.invalid";
+
 import {
   fetchPackageDetail,
   fetchPackageFile,

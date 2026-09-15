@@ -108,7 +108,7 @@ export function SkillRelatedSection({
                   {isCompact ? (
                     <span
                       className="related-skill-stats"
-                      aria-label={`${entry.skill.stats.downloads.toLocaleString()} downloads`}
+                      aria-label={`${entry.skill.stats.downloads.toLocaleString("en-US")} downloads`}
                     >
                       {formattedStats.downloads}
                     </span>
