@@ -1,4 +1,4 @@
-import type { EvidenceSearchDigest, SearchRecommendation } from "./searchDigestContract";
+import type { MonthlySearchDigest, MonthlySearchRecommendation } from "./searchDigestContract";
 import { SEARCH_DIGEST_MAX_BYTES } from "./searchDigestContract";
 
 type Scope = "catalog" | "shelf" | "legacy";
@@ -11,7 +11,7 @@ type EvidenceRow = {
   searchUrl: string;
   classification: { intentKind: string; confidence: number; companyProductName?: string } | null;
 };
-type Catalog = EvidenceSearchDigest["catalogs"]["plugins"];
+type Catalog = MonthlySearchDigest["catalogs"]["plugins"];
 export type DigestCatalogInput = {
   totalSearches7d: number;
   sources7d: { "clawhub-web": number; "openclaw-control-ui": number };
@@ -24,7 +24,18 @@ export type DigestCatalogInput = {
   rows: EvidenceRow[];
   moverRows: EvidenceRow[];
   recommendations: {
-    candidates: Omit<SearchRecommendation, "metadataCheckedAt">[];
+    candidates: Omit<
+      MonthlySearchRecommendation,
+      "metadataCheckedAt" | "slot" | "selectionBasis" | "reason"
+    >[];
+    lineup: Omit<Catalog["lineup"], "changes"> & {
+      proposed: Array<
+        Omit<MonthlySearchRecommendation, "metadataCheckedAt"> & {
+          change: "retain" | "add";
+          emerging: boolean;
+        }
+      >;
+    };
     omittedCandidates: number;
   };
 };
@@ -34,7 +45,7 @@ export function buildSearchEvidenceDigest(input: {
   weekEnd: number;
   siteUrl: string;
   catalogs: { plugins: DigestCatalogInput; skills: DigestCatalogInput };
-}): EvidenceSearchDigest {
+}): MonthlySearchDigest {
   const site = new URL(input.siteUrl);
   const absolute = (path: string) => {
     const url = new URL(path, site);
@@ -109,17 +120,15 @@ export function buildSearchEvidenceDigest(input: {
     const qualified =
       source.metadataCheckedAt === null
         ? []
-        : source.recommendations.candidates.filter(
+        : source.recommendations.lineup.proposed.filter(
             (candidate) =>
               candidate.artifactKind === kind &&
               representable(candidate.id, 256) &&
-              absolute(candidate.url).length <= 2048 &&
-              (candidate.support !== "search-only" ||
-                (candidate.search?.matchedSearches7d ?? 0) >= 3),
+              absolute(candidate.url).length <= 2048,
           );
-    truncated ||=
-      qualified.length !== source.recommendations.candidates.length ||
-      [gaps, company, moving, qualified].some((section) => section.length > 5);
+    if (qualified.length !== source.recommendations.lineup.proposed.length)
+      throw new Error("The complete Featured selection cannot be represented in this digest");
+    truncated ||= [gaps, company, moving].some((section) => section.length > 5);
     return {
       totalSearches: source.totalSearches7d,
       sourceCounts: {
@@ -137,6 +146,11 @@ export function buildSearchEvidenceDigest(input: {
       adoption: {
         status: source.adoption.status,
         generatedAt: source.adoption.generatedAt,
+        collectionStartedAt: source.adoption.collectionStartedAt,
+        periodStart7d: source.adoption.periodStart7d,
+        scannedRows: source.adoption.scannedRows,
+        importedRows: source.adoption.importedRows,
+        importDatasetVersions: source.adoption.importDatasetVersions,
         periodStart: source.adoption.periodStart,
         periodEnd: source.adoption.periodEnd,
         snapshotId: source.adoption.snapshotId,
@@ -154,7 +168,39 @@ export function buildSearchEvidenceDigest(input: {
       })),
       officialGaps: gaps.slice(0, 5).map(row),
       movers: moving.slice(0, 5).map(row),
-      recommendations: qualified.slice(0, 5).map((candidate) => {
+      lineup: {
+        targetSize: 16,
+        reservedSlots: source.recommendations.lineup.reservedSlots,
+        telemetryTarget: source.recommendations.lineup.telemetryTarget,
+        pendingCount: source.recommendations.lineup.pendingCount,
+        telemetryShortfall: source.recommendations.lineup.telemetryShortfall,
+        editorialRevision: source.recommendations.lineup.editorialRevision,
+        currentEditorialRevision: source.recommendations.lineup.currentEditorialRevision,
+        staleEditorial: source.recommendations.lineup.staleEditorial,
+        reservations: source.recommendations.lineup.reservations.map((entry) => ({
+          slot: entry.slot,
+          id: entry.id,
+          name: entry.name,
+          displayName: entry.displayName,
+          reason: entry.reason,
+          status: entry.status,
+          pendingReasons: entry.pendingReasons,
+        })),
+        baseline: source.recommendations.lineup.baseline.map(({ id, version, featuredAt }) => ({
+          id,
+          version,
+          featuredAt,
+        })),
+        changes: qualified.map(({ id, change, emerging }) => ({ id, change, emerging })),
+        removals: source.recommendations.lineup.removals.map((entry) => ({
+          id: entry.id,
+          displayName: descriptor(entry.displayName),
+          url: absolute(entry.url),
+          reasons: entry.reasons,
+        })),
+        shortfall: 16 - qualified.length,
+      },
+      recommendations: qualified.map((candidate) => {
         const search = candidate.search;
         // Counts remain available for adoption-supported candidates; rare query
         // text never leaves the staff report. Preserve the canonical candidate order.
@@ -165,6 +211,10 @@ export function buildSearchEvidenceDigest(input: {
         const adoption = candidate.adoption;
         return {
           artifactKind: candidate.artifactKind,
+          slot: candidate.slot,
+          selectionBasis: candidate.selectionBasis,
+          reason: candidate.reason,
+          version: candidate.version,
           id: candidate.id,
           displayName: descriptor(candidate.displayName) || descriptor(candidate.id),
           url: absolute(candidate.url),
@@ -194,16 +244,10 @@ export function buildSearchEvidenceDigest(input: {
             ? {
                 source: adoption.source,
                 rank: adoption.rank,
-                snapshotId: adoption.snapshotId,
-                rankingVersion: adoption.rankingVersion,
-                periodStart: adoption.periodStart,
-                periodEnd: adoption.periodEnd,
-                generatedAt: adoption.generatedAt,
-                sourceObservedAt: adoption.sourceObservedAt,
-                downloads: adoption.downloads,
-                installs: adoption.installs,
-                bookmarks: adoption.bookmarks,
-                lifetimeInstalls: adoption.lifetimeInstalls,
+                installs30d: adoption.installs30d,
+                installs7d: adoption.installs7d,
+                importedRows: adoption.importedRows,
+                importDatasetVersions: adoption.importDatasetVersions,
               }
             : null,
         };
@@ -214,8 +258,8 @@ export function buildSearchEvidenceDigest(input: {
     plugins: project(input.catalogs.plugins, "plugin"),
     skills: project(input.catalogs.skills, "skill"),
   };
-  const digest: EvidenceSearchDigest = {
-    kind: "search_intelligence_weekly_v2",
+  const digest: MonthlySearchDigest = {
+    kind: "search_intelligence_weekly_v4",
     weekStart: input.weekEnd - 604_800_000,
     weekEnd: input.weekEnd,
     minimumSearches: 3,
@@ -225,11 +269,24 @@ export function buildSearchEvidenceDigest(input: {
   };
   const sections = Object.values(catalogs).flatMap((catalog) => [
     catalog.movers,
-    catalog.recommendations,
     catalog.officialGaps,
     catalog.companyOpportunities,
   ]);
+  // Preserve every proposed member and its change; trim query detail and
+  // secondary opportunity rows before the complete lineup can be obscured.
+  const candidateQueries = Object.values(catalogs).flatMap((catalog) =>
+    catalog.recommendations
+      .map((candidate) => candidate.search)
+      .filter((search) => search !== null),
+  );
   while (new TextEncoder().encode(JSON.stringify(digest)).byteLength > SEARCH_DIGEST_MAX_BYTES) {
+    const search = candidateQueries.find((entry) => entry.queries.length > 0);
+    if (search) {
+      search.queries.pop();
+      search.omittedQueries += 1;
+      digest.truncated = true;
+      continue;
+    }
     const longest = sections.reduce((best, section) =>
       section.length > best.length ? section : best,
     );

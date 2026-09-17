@@ -155,6 +155,9 @@ export type PublishOptions = {
   migrateOwner?: boolean;
   stagePrePublicationChecks?: boolean;
   skillPublishUploadTickets?: Id<"skillPublishUploadTickets">[];
+  // Called synchronously once a pending or published version owns the files.
+  // Later failures belong to publication compensation, not request upload cleanup.
+  onFilesPersisted?: () => void;
 };
 
 type InternalPublishOptions = PublishOptions;
@@ -582,6 +585,7 @@ async function publishVersionForUserInternal(
       internal.skills.insertVersion,
       skillInsertArgs,
     )) as PublishResult;
+    options.onFilesPersisted?.();
     await scheduleSkillPublishFollowups(ctx, publishResult, followup);
     return {
       ...publishResult,
@@ -600,6 +604,7 @@ async function publishVersionForUserInternal(
     internal.skills.insertVersion,
     pendingInsertArgs,
   )) as PublishResult;
+  options.onFilesPersisted?.();
 
   const staged = (await ctx
     .runMutation(internal.publishAttempts.createSkillPublishAttemptInternal, {

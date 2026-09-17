@@ -9,6 +9,17 @@
 
 ### Fixes
 
+- Deploy: coalesce pending skills.sh syncs per ref before they enter the production deployment queue, while preserving active sync cleanup and queued manual deploys.
+
+- Workers: reserve Skill Card capacity by lease slot to avoid global queue contention, continue after partial batches, and release undelivered leases when input hydration fails.
+
+- Workers: redact quoted credentials completely in serialized JSON diagnostics while preserving adjacent non-secret context.
+- Deploy: queue production deployments and hourly skills.sh synchronization together so rollout pauses cannot interrupt synchronization or rollback; retain bounded, redacted failure receipts when synchronization fails.
+- Tests: shorten local Convex scratch paths when a deeply nested `TMPDIR` shares the workspace filesystem, while retaining short overrides and avoiding Unix socket path failures.
+- API/CLI: preserve owner-qualified skill identities in catalog listings and accept explicit null public versions consistently across API and CLI schemas (thanks @HwangBae for the report and @goutamadwant for the fix).
+- Workers: delete a newly generated Skill Card blob when attachment fails, while preserving successfully attached cards and historical bundle fingerprints (thanks @SebTardif).
+- Publishing: fall back to local changelog notes when the provider stalls for ten seconds, including while reading the response body (thanks @SebTardif).
+- Web: bound Agent Skills discovery proxy requests to ten seconds, including stalled response bodies, so installers can recover from an unresponsive upstream (thanks @SebTardif).
 - CLI: preserve literal multipart text when publishing with Bun, including semicolons in JSON metadata and values beginning with `@` or `<`, without changing uploaded file bytes.
 - Workers: scan plugin packages containing both skill and plugin manifests without ambiguous-target failures, preserving full-package scanning and bundled-skill paths.
 - CLI/API: recover failed staged plugin publications from their retained artifacts with `clawhub package recover`, fresh security checks, current publisher authorization, and preserved attempt history.

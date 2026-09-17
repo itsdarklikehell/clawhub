@@ -9,6 +9,7 @@ import {
   ApiV1PackageValidationReportPageSchema,
   ApiV1PackageModerationStatusResponseSchema,
   ApiV1PackageSecurityResponseSchema,
+  ApiV1PluginDetailResponseSchema,
   PackageHardDeleteRequestSchema,
   PackageAppealResolveRequestSchema,
   PackageAppealRequestSchema,
@@ -30,6 +31,7 @@ import {
   PLUGIN_CATEGORY_DEFINITIONS,
   parseArk,
   type ApiV1PackageCategoriesBatchRequest,
+  type ApiV1PackageSecurityResponse,
   type ApiV1PluginOverviewResponse,
   type PackageListItem,
   type PackagePublishMetadata,
@@ -81,9 +83,9 @@ import {
   getPublicSkillVersionAccessBlock,
   getPublicSkillVersionDownloadBlock,
   getSkillFileModerationInfoFromSkill,
-  isSkillVersionForSkill,
 } from "../lib/skillFileAccess";
 import { isMacJunkPath } from "../lib/skills";
+import type { PublicSkillVersionSelection } from "../lib/skills/publicVersions";
 import {
   buildDeterministicPackageZip,
   buildMergedExportZip,
@@ -149,9 +151,9 @@ const internalRefs = internal as unknown as {
     deleteTrustedPublisherForUserInternal: unknown;
     deleteOwnedReleaseForUserInternal: unknown;
     restoreOwnedReleaseForUserInternal: unknown;
-    getReleasesByIdsInternal: unknown;
-    getReleaseByPackageAndVersionInternal: unknown;
-    getReleaseByIdInternal: unknown;
+    getTagsForViewerInternal: unknown;
+    getReleaseForViewerInternal: unknown;
+    getPublicReleaseSelectionsInternal: unknown;
     insertAuditLogInternal: unknown;
     recordPackageDownloadInternal: unknown;
     recordPackageInstallInternal: unknown;
@@ -185,8 +187,7 @@ const internalRefs = internal as unknown as {
     getSkillBySlugInternal: unknown;
     hasMissingPackageCatalogRecommendationScoresInternal: unknown;
     searchPackageCatalogForHttpInternal: unknown;
-    getVersionByIdInternal: unknown;
-    getVersionBySkillAndVersionInternal: unknown;
+    getPublicVersionSelectionInternal: unknown;
   };
   publishers: {
     getByHandleInternal: unknown;
@@ -537,6 +538,7 @@ type SkillVersionLike = {
     contentType?: string;
   }>;
   softDeletedAt?: number;
+  publicationStatus?: "pending" | "published" | "blocked";
 };
 
 type ReleaseLike = {
@@ -576,6 +578,8 @@ type ReleaseLike = {
   npmUnpackedSize?: number;
   npmFileCount?: number;
   softDeletedAt?: number;
+  ownerDeletedAt?: number;
+  publicationStatus?: "pending" | "published" | "blocked";
 };
 
 type PluginExportFamily = (typeof PLUGIN_EXPORT_FAMILY_VALUES)[number];
@@ -622,11 +626,6 @@ type AdminRepairPackageLike = Pick<
 >;
 
 type RepairOwnerPublisherLike = Pick<Doc<"publishers">, "_id" | "handle" | "deletedAt">;
-
-function toVisibleRelease(release: ReleaseLike | null) {
-  if (!release || ("softDeletedAt" in release && release.softDeletedAt !== undefined)) return null;
-  return release;
-}
 
 function toPublicTrustedPublisher(trustedPublisher: PackageTrustedPublisherLike | null) {
   if (!trustedPublisher) return null;
@@ -692,6 +691,33 @@ function toReleaseArtifact(release: ReleaseLike, packageName?: string) {
     ...(sha256 ? { artifactSha256: sha256 } : {}),
     packageName,
     version: release.version,
+  };
+}
+
+function toPackageVersionResponse(release: ReleaseLike, packageName: string) {
+  const scanStatus = resolvePackageReleaseScanStatus(release);
+  const verification = release.verification ? { ...release.verification, scanStatus } : null;
+  return {
+    version: release.version,
+    createdAt: release.createdAt,
+    changelog: release.changelog,
+    distTags: release.distTags ?? [],
+    files: release.files.map((file) => ({
+      path: file.path,
+      size: file.size,
+      sha256: file.sha256,
+      contentType: file.contentType,
+    })),
+    compatibility: release.compatibility ?? null,
+    pluginManifestSummary: release.pluginManifestSummary ?? null,
+    clawManifestSummary: release.clawManifestSummary ?? null,
+    verification,
+    artifact: toReleaseArtifact(release, packageName),
+    sha256hash: release.sha256hash ?? null,
+    vtAnalysis: release.vtAnalysis ?? null,
+    skillSpectorAnalysis: release.skillSpectorAnalysis ?? null,
+    llmAnalysis: release.llmAnalysis ?? null,
+    staticScan: release.staticScan ?? null,
   };
 }
 
@@ -860,23 +886,14 @@ async function streamClawPackRelease(
 
 async function resolvePackageTags(
   ctx: ActionCtx,
-  tags: Record<string, Id<"packageReleases">>,
+  pkg: Pick<PublicPackageDocLike, "_id" | "name">,
+  viewerUserId?: Id<"users">,
 ): Promise<Record<string, string>> {
-  const releaseIds = Object.values(tags);
-  if (releaseIds.length === 0) return {};
-  const releases = await runQueryRef<ReleaseLike[]>(
-    ctx,
-    internalRefs.packages.getReleasesByIdsInternal,
-    {
-      releaseIds,
-    },
-  );
-  const byId = new Map(releases.map((release) => [release._id, release.version]));
-  return Object.fromEntries(
-    Object.entries(tags)
-      .map(([tag, releaseId]) => [tag, byId.get(releaseId)])
-      .filter((entry): entry is [string, string] => Boolean(entry[1])),
-  );
+  return await runQueryRef(ctx, internalRefs.packages.getTagsForViewerInternal, {
+    name: pkg.name,
+    packageId: pkg._id,
+    viewerUserId,
+  });
 }
 
 type CatalogListItem = PackageListItem & {
@@ -1256,9 +1273,8 @@ async function resolveSkillTags(
   ctx: ActionCtx,
   skillId: Id<"skills">,
   tags: Record<string, Id<"skillVersions">>,
-  latestVersion?: SkillVersionLike | null,
 ): Promise<Record<string, string>> {
-  const [resolved] = await resolveTagsBatch(ctx, [tags], [latestVersion], [skillId]);
+  const [resolved] = await resolveTagsBatch(ctx, [tags], [skillId]);
   return resolved ?? {};
 }
 
@@ -1295,6 +1311,24 @@ function toSkillPackageDetail(
           handle: owner.handle ?? null,
           displayName: owner.displayName ?? null,
           image: owner.image ?? null,
+        }
+      : null,
+  };
+}
+
+function toPackageMetadataResponse(
+  pkg: PublicPackageDocLike,
+  owner: PublicPublisher | null,
+  tags: Record<string, string>,
+) {
+  return {
+    package: { ...toPackageDetailResponsePackage(pkg), tags },
+    owner: owner
+      ? {
+          handle: owner.handle ?? null,
+          displayName: owner.displayName ?? null,
+          image: owner.image ?? null,
+          official: owner.official === true,
         }
       : null,
   };
@@ -1344,12 +1378,34 @@ function bytesToArrayBuffer(bytes: Uint8Array) {
   return copy.buffer;
 }
 
+async function storeRequestPackageBlob(
+  ctx: ActionCtx,
+  requestStorageIds: Set<Id<"_storage">>,
+  blob: Blob,
+) {
+  const storageId = await ctx.storage.store(blob);
+  requestStorageIds.add(storageId);
+  return storageId;
+}
+
+async function settlePackageFileStores(stores: Array<Promise<StoredPackagePublishFile>>) {
+  // A rejected store does not cancel its siblings. Wait before reclaiming their blobs.
+  const results = await Promise.allSettled(stores);
+  return results.map((result) => {
+    if (result.status === "rejected") throw result.reason;
+    return result.value;
+  });
+}
+
 async function storeClawPackFile(
   ctx: ActionCtx,
   entry: { path: string; bytes: Uint8Array },
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<StoredPackagePublishFile> {
   const contentType = defaultStoredPackageContentType();
-  const storageId = await ctx.storage.store(
+  const storageId = await storeRequestPackageBlob(
+    ctx,
+    requestStorageIds,
     new Blob([bytesToArrayBuffer(entry.bytes)], { type: contentType }),
   );
   return {
@@ -1370,12 +1426,17 @@ const CLAWPACK_STORE_BATCH_FILES = 16;
 async function storeClawPackFiles(
   ctx: ActionCtx,
   entries: Array<{ path: string; bytes: Uint8Array }>,
+  requestStorageIds: Set<Id<"_storage">>,
 ) {
   const files: StoredPackagePublishFile[] = [];
   let batch: Array<{ path: string; bytes: Uint8Array }> = [];
   let batchBytes = 0;
   const flush = async () => {
-    files.push(...(await Promise.all(batch.map((entry) => storeClawPackFile(ctx, entry)))));
+    files.push(
+      ...(await settlePackageFileStores(
+        batch.map((entry) => storeClawPackFile(ctx, entry, requestStorageIds)),
+      )),
+    );
     batch = [];
     batchBytes = 0;
   };
@@ -1394,13 +1455,16 @@ async function storeClawPackFiles(
 async function storeUploadedPackageFile(
   ctx: ActionCtx,
   entry: File,
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<StoredPackagePublishFile> {
   if (entry.size > MAX_PUBLISH_FILE_BYTES) {
     throw new Error(getPublishFileSizeError(entry.name));
   }
   const buffer = new Uint8Array(await entry.arrayBuffer());
   const contentType = normalizeContentType(entry.type) ?? defaultStoredPackageContentType();
-  const storageId = await ctx.storage.store(
+  const storageId = await storeRequestPackageBlob(
+    ctx,
+    requestStorageIds,
     new Blob([bytesToArrayBuffer(buffer)], { type: contentType }),
   );
   return {
@@ -1483,6 +1547,7 @@ async function buildPackagePublishRequestFromClawPack(
   parsed: ParsedPackageClawPack,
   artifactBytes: Uint8Array,
   artifactStorageId: Id<"_storage">,
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<ServerPackagePublishRequest> {
   if (parsed.unpackedSize > MAX_PUBLISH_TOTAL_BYTES) {
     throw new Error(getPublishTotalSizeError("package"));
@@ -1499,7 +1564,7 @@ async function buildPackagePublishRequestFromClawPack(
     npmUnpackedSize: parsed.unpackedSize,
     npmFileCount: parsed.fileCount,
   };
-  const files = await storeClawPackFiles(ctx, parsed.entries);
+  const files = await storeClawPackFiles(ctx, parsed.entries, requestStorageIds);
   return { ...metadata, files, artifact };
 }
 
@@ -1550,6 +1615,7 @@ async function parseMultipartPackagePublish(
   ctx: ActionCtx,
   auth: PackagePublishAuth,
   request: Request,
+  requestStorageIds: Set<Id<"_storage">>,
 ): Promise<ServerPackagePublishRequest> {
   const form = await request.formData();
   for (const field of form.keys()) {
@@ -1598,6 +1664,7 @@ async function parseMultipartPackagePublish(
         parsed,
         artifactBytes,
         tarballPart.storageId,
+        requestStorageIds,
       );
     }
 
@@ -1617,7 +1684,9 @@ async function parseMultipartPackagePublish(
     const artifactBytes = new Uint8Array(await tarballEntry.arrayBuffer());
     const parsed = await parseClawPack(artifactBytes);
     assertClawPackPublicationIdentity(metadata, parsed);
-    const artifactStorageId = await ctx.storage.store(
+    const artifactStorageId = await storeRequestPackageBlob(
+      ctx,
+      requestStorageIds,
       new Blob([bytesToArrayBuffer(artifactBytes)], { type: "application/octet-stream" }),
     );
     return await buildPackagePublishRequestFromClawPack(
@@ -1626,6 +1695,7 @@ async function parseMultipartPackagePublish(
       parsed,
       artifactBytes,
       artifactStorageId,
+      requestStorageIds,
     );
   }
 
@@ -1640,8 +1710,8 @@ async function parseMultipartPackagePublish(
   }
 
   const packageFileParts = fileParts.filter((entry) => !isMacJunkPath(entry.name));
-  const files = await Promise.all(
-    packageFileParts.map((entry) => storeUploadedPackageFile(ctx, entry)),
+  const files = await settlePackageFileStores(
+    packageFileParts.map((entry) => storeUploadedPackageFile(ctx, entry, requestStorageIds)),
   );
   if (files.length === 0) throw new Error("files required");
   return { ...metadata, files };
@@ -2251,13 +2321,26 @@ export async function exportPluginsV1Handler(ctx: ActionCtx, request: Request) {
 
   try {
     logContext.phase = "load_releases";
-    const releases = await chunkedParallel(result.page, 100, (digest) =>
-      digest.latestReleaseId
-        ? runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
-            releaseId: digest.latestReleaseId,
-          })
-        : Promise.resolve(null),
-    );
+    const releases: Array<ReleaseLike | null> = [];
+    // Each query rechecks current parents and release visibility after the digest read.
+    // Keep full-document batches small enough for Convex's transaction read budget.
+    for (let offset = 0; offset < result.page.length; offset += 5) {
+      const page = result.page.slice(offset, offset + 5);
+      const selections = page.flatMap((digest) =>
+        digest.latestReleaseId
+          ? [{ packageId: digest.packageId, releaseId: digest.latestReleaseId }]
+          : [],
+      );
+      const selected = await runQueryRef<Array<ReleaseLike | null>>(
+        ctx,
+        internalRefs.packages.getPublicReleaseSelectionsInternal,
+        { selections },
+      );
+      let index = 0;
+      releases.push(
+        ...page.map((digest) => (digest.latestReleaseId ? (selected[index++] ?? null) : null)),
+      );
+    }
     logContext.releaseCount = releases.filter(Boolean).length;
     const exportableReleases: Array<ReleaseLike | null> = Array.from(
       { length: result.page.length },
@@ -2280,21 +2363,21 @@ export async function exportPluginsV1Handler(ctx: ActionCtx, request: Request) {
       if (!digest.latestReleaseId || !release) {
         exportErrors.push({
           package: digest.name,
-          error: `release not found (latestReleaseId: ${digest.latestReleaseId ?? "null"})`,
+          error: "release not available",
         });
         continue;
       }
       if (!isReleaseForPackage(release, digest)) {
         exportErrors.push({
           package: digest.name,
-          error: `release not found (latestReleaseId: ${digest.latestReleaseId})`,
+          error: "release not available",
         });
         continue;
       }
       if (release.softDeletedAt) {
         exportErrors.push({
           package: digest.name,
-          error: `release not available (latestReleaseId: ${digest.latestReleaseId})`,
+          error: "release not available",
         });
         continue;
       }
@@ -2622,24 +2705,34 @@ export async function publishPackageV1Handler(ctx: ActionCtx, request: Request) 
   const auth = await requirePackagePublishAuthOrResponse(ctx, request, rate.headers);
   if (!auth.ok) return auth.response;
 
+  const requestStorageIds = new Set<Id<"_storage">>();
+  let publicationOwnsCleanup = false;
   try {
     const contentType = request.headers.get("content-type") ?? "";
     if (!contentType.includes("multipart/form-data")) {
       return text("Package publish requires multipart/form-data", 415, rate.headers);
     }
-    const payload = await parseMultipartPackagePublish(ctx, auth.auth, request);
+    const payload = await parseMultipartPackagePublish(ctx, auth.auth, request, requestStorageIds);
+    // After dispatch, only the action can know whether a release adopted these blobs.
+    // An ambiguous RPC failure is not authority for HTTP cleanup.
+    publicationOwnsCleanup = true;
     const result =
       auth.auth.kind === "user"
         ? await runActionRef(ctx, internalRefs.packages.publishPackageForUserInternal, {
             actorUserId: auth.auth.userId,
             payload,
+            requestStorageIds: [...requestStorageIds],
           })
         : await runActionRef(ctx, internalRefs.packages.publishPackageForTrustedPublisherInternal, {
             publishTokenId: auth.auth.publishToken._id,
             payload,
+            requestStorageIds: [...requestStorageIds],
           });
     return json(result, 200, rate.headers);
   } catch (error) {
+    if (!publicationOwnsCleanup) {
+      await Promise.allSettled([...requestStorageIds].map((id) => ctx.storage.delete(id)));
+    }
     return packagePublishErrorToResponse(error, rate.headers);
   }
 }
@@ -3780,40 +3873,51 @@ export async function packagesDeleteRouterV1Handler(ctx: ActionCtx, request: Req
 
 async function getReleaseForRequest(
   ctx: ActionCtx,
-  pkg: Pick<PublicPackageDocLike, "_id" | "tags" | "latestReleaseId">,
+  pkg: Pick<PublicPackageDocLike, "_id" | "name">,
   request: Request,
+  viewerUserId?: Id<"users">,
 ): Promise<ReleaseLike | null> {
   const url = new URL(request.url);
-  const versionParam = url.searchParams.get("version")?.trim();
-  const tagParam = url.searchParams.get("tag")?.trim();
-
-  if (versionParam) {
-    return toVisibleRelease(
-      await runQueryRef<ReleaseLike | null>(
-        ctx,
-        internalRefs.packages.getReleaseByPackageAndVersionInternal,
-        {
-          packageId: pkg._id,
-          version: versionParam,
-        },
-      ),
-    );
-  }
-  if (tagParam) {
-    const releaseId = pkg.tags[tagParam];
-    if (!releaseId) return null;
-    return toVisibleRelease(
-      await runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
-        releaseId,
-      }),
-    );
-  }
-  if (!pkg.latestReleaseId) return null;
-  return toVisibleRelease(
-    await runQueryRef<ReleaseLike | null>(ctx, internalRefs.packages.getReleaseByIdInternal, {
-      releaseId: pkg.latestReleaseId,
-    }),
+  const snapshot = await runQueryRef<{ release: ReleaseLike } | null>(
+    ctx,
+    internalRefs.packages.getReleaseForViewerInternal,
+    {
+      name: pkg.name,
+      packageId: pkg._id,
+      version: url.searchParams.get("version")?.trim() || undefined,
+      tag: url.searchParams.get("tag")?.trim() || undefined,
+      viewerUserId,
+    },
   );
+  return snapshot?.release ?? null;
+}
+
+async function packageFileResponse(
+  ctx: ActionCtx,
+  release: ReleaseLike,
+  path: string,
+  preview: boolean,
+  headers: HeadersInit,
+) {
+  const securityBlock = getReleaseSecurityBlock(release);
+  if (securityBlock) return text(securityBlock.message, securityBlock.status, headers);
+  const file = resolvePackageFilePath(release, path);
+  if (!file) return text("File not found", 404, headers);
+  const maxBytes = preview ? MAX_RAW_FILE_BYTES : MAX_PUBLISH_FILE_BYTES;
+  if (file.size > maxBytes) return text("File too large", 413, headers);
+  const blob = await ctx.storage.get(file.storageId);
+  if (!blob) return text("File not found", 404, headers);
+  const responseParams = {
+    blob,
+    path: file.path,
+    contentType: file.contentType,
+    sha256: file.sha256,
+    size: file.size,
+    headers: headers,
+  };
+  return preview
+    ? await safeStoredFilePreviewResponse(responseParams)
+    : await safeStoredFileResponse(responseParams);
 }
 
 function isReadmeVariantPath(path: string) {
@@ -3933,54 +4037,35 @@ async function getUnavailableSkillPackageVersionBlock(
   );
   if (!skill || skill.softDeletedAt) return null;
 
-  const version = (await runQueryRef(ctx, internalRefs.skills.getVersionBySkillAndVersionInternal, {
-    skillId: skill._id,
-    version: versionName,
-  })) as SkillVersionLike | null;
-  if (!version || !isSkillVersionForSkill(version, skill._id)) return null;
-  if (version.softDeletedAt) return { status: 410, message: "Version not available" };
-
+  const selection = await runQueryRef<PublicSkillVersionSelection>(
+    ctx,
+    internalRefs.skills.getPublicVersionSelectionInternal,
+    { skillId: skill._id, version: versionName },
+  );
+  if (selection.status === "deleted") return { status: 410, message: "Version not available" };
+  if (selection.status !== "available") return null;
   return getPublicSkillVersionAccessBlock(
-    getSkillFileModerationInfoFromSkill(skill),
-    version._id,
-    skill.latestVersionId ?? skill.tags?.latest,
+    getSkillFileModerationInfoFromSkill(selection.skill),
+    selection.version._id,
+    selection.skill.latestVersionId ?? selection.skill.tags?.latest,
   );
 }
 
 async function getSkillVersionForRequest(
   ctx: ActionCtx,
-  skill: Pick<SkillPackageDocLike, "_id" | "latestVersionId" | "tags">,
+  skill: Pick<SkillPackageDocLike, "_id">,
   request: Request,
 ) {
   const url = new URL(request.url);
-  const versionParam = url.searchParams.get("version")?.trim();
-  const tagParam = url.searchParams.get("tag")?.trim();
-
-  if (versionParam) {
-    const version = (await runQueryRef(
-      ctx,
-      internalRefs.skills.getVersionBySkillAndVersionInternal,
-      {
-        skillId: skill._id,
-        version: versionParam,
-      },
-    )) as SkillVersionLike | null;
-    return isSkillVersionForSkill(version, skill._id) ? version : null;
-  }
-  if (tagParam) {
-    const versionId = skill.tags[tagParam];
-    if (!versionId) return null;
-    const version = (await runQueryRef(ctx, internalRefs.skills.getVersionByIdInternal, {
-      versionId,
-    })) as SkillVersionLike | null;
-    return isSkillVersionForSkill(version, skill._id) ? version : null;
-  }
-  const latestVersionId = skill.latestVersionId ?? skill.tags.latest;
-  if (!latestVersionId) return null;
-  const version = (await runQueryRef(ctx, internalRefs.skills.getVersionByIdInternal, {
-    versionId: latestVersionId,
-  })) as SkillVersionLike | null;
-  return isSkillVersionForSkill(version, skill._id) ? version : null;
+  return await runQueryRef<PublicSkillVersionSelection>(
+    ctx,
+    internalRefs.skills.getPublicVersionSelectionInternal,
+    {
+      skillId: skill._id,
+      version: url.searchParams.get("version")?.trim() || undefined,
+      tag: url.searchParams.get("tag")?.trim() || undefined,
+    },
+  );
 }
 
 async function searchPackages(
@@ -4343,6 +4428,50 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
   if (!normalizedPackageName) return text("Package not found", 404, rate.headers);
 
   const viewerUserId = await getOptionalViewerUserIdForRequest(ctx, request);
+  if (packageSegments[0] === "detail" && packageSegments.length === 1) {
+    const version = new URL(request.url).searchParams.get("version")?.trim() || undefined;
+    const snapshot = await ctx.runQuery(internal.packages.getPluginDetailForViewerInternal, {
+      name: normalizedPackageName,
+      viewerUserId: viewerUserId ?? undefined,
+      version,
+    });
+    if (!snapshot) return text("Package not found", 404, rate.headers);
+    const release = snapshot.release;
+    if (version && !release) return text("Version not found", 404, rate.headers);
+    let readme: string | null = null;
+    let security: ApiV1PackageSecurityResponse | null = null;
+    if (release) {
+      const preview = await packageFileResponse(ctx, release, "README.md", true, rate.headers);
+      if (preview.ok) readme = await preview.text();
+      else if (![403, 404, 415, 423].includes(preview.status)) return preview;
+      try {
+        security = parseArk(
+          ApiV1PackageSecurityResponseSchema,
+          toPackageReleaseSecurityResponse({ request, pkg: snapshot.package, release }),
+          "Package security response",
+        );
+      } catch {
+        // Security is optional in the detail view; malformed historical scan
+        // metadata must not hide an otherwise readable package and README.
+      }
+    }
+    const { publicDownloadBlocked: _publicDownloadBlocked, ...pkg } = snapshot.package;
+    return json(
+      parseArk(
+        ApiV1PluginDetailResponseSchema,
+        {
+          ...toPackageMetadataResponse(pkg, snapshot.owner, snapshot.tags),
+          versions: snapshot.versions,
+          version: release ? toPackageVersionResponse(release, pkg.name) : null,
+          readme,
+          security,
+        },
+        "Plugin detail response",
+      ),
+      200,
+      rate.headers,
+    );
+  }
   if (
     packageSegments[0] === "versions" &&
     packageSegments[1] &&
@@ -4418,37 +4547,15 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
           skillDetail.skill,
           skillDetail.latestVersion,
           skillDetail.owner,
-          await resolveSkillTags(
-            ctx,
-            skillDetail.skill._id,
-            skillDetail.skill.tags,
-            skillDetail.latestVersion,
-          ),
+          await resolveSkillTags(ctx, skillDetail.skill._id, skillDetail.skill.tags),
         ),
         200,
         rate.headers,
       );
     }
-    const tags = await resolvePackageTags(ctx, publicPackage!.tags);
+    const tags = await resolvePackageTags(ctx, publicPackage!, viewerUserId ?? undefined);
 
-    return json(
-      {
-        package: {
-          ...toPackageDetailResponsePackage(publicPackage!),
-          tags,
-        },
-        owner: packageOwner
-          ? {
-              handle: packageOwner.handle ?? null,
-              displayName: packageOwner.displayName ?? null,
-              image: packageOwner.image ?? null,
-              official: packageOwner.official === true,
-            }
-          : null,
-      },
-      200,
-      rate.headers,
-    );
+    return json(toPackageMetadataResponse(publicPackage!, packageOwner, tags), 200, rate.headers);
   }
 
   if (packageSegments[0] === "trusted-publisher" && packageSegments.length === 1) {
@@ -4582,21 +4689,17 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
 
   if (packageSegments[0] === "versions" && packageSegments[1]) {
     if (skillDetail?.skill) {
-      const version = (await runQueryRef(
+      const selection = await runQueryRef<PublicSkillVersionSelection>(
         ctx,
-        internalRefs.skills.getVersionBySkillAndVersionInternal,
-        {
-          skillId: skillDetail.skill._id,
-          version: packageSegments[1],
-        },
-      )) as SkillVersionLike | null;
-      if (!version || version.softDeletedAt) return text("Version not found", 404, rate.headers);
-      const effectiveLatestVersionId =
-        skillDetail.skill.latestVersionId ?? skillDetail.skill.tags?.latest;
+        internalRefs.skills.getPublicVersionSelectionInternal,
+        { skillId: skillDetail.skill._id, version: packageSegments[1] },
+      );
+      if (selection.status !== "available") return text("Version not found", 404, rate.headers);
+      const { skill, version } = selection;
       const moderationBlock = getPublicSkillVersionAccessBlock(
-        skillDetail.moderationInfo,
+        getSkillFileModerationInfoFromSkill(skill),
         version._id,
-        effectiveLatestVersionId,
+        skill.latestVersionId ?? skill.tags?.latest,
       );
       if (moderationBlock)
         return text(moderationBlock.message, moderationBlock.status, rate.headers);
@@ -4638,10 +4741,6 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
       },
     )) as { package: PublicPackageDocLike; version: ReleaseLike } | null;
     if (!result) return text("Version not found", 404, rate.headers);
-    const scanStatus = resolvePackageReleaseScanStatus(result.version);
-    const verification = result.version.verification
-      ? { ...result.version.verification, scanStatus }
-      : null;
     return json(
       {
         package: {
@@ -4649,28 +4748,7 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
           displayName: result.package.displayName,
           family: result.package.family,
         },
-        version: {
-          version: result.version.version,
-          createdAt: result.version.createdAt,
-          changelog: result.version.changelog,
-          distTags: result.version.distTags ?? [],
-          files: result.version.files.map((file) => ({
-            path: file.path,
-            size: file.size,
-            sha256: file.sha256,
-            contentType: file.contentType,
-          })),
-          compatibility: result.version.compatibility ?? null,
-          pluginManifestSummary: result.version.pluginManifestSummary ?? null,
-          clawManifestSummary: result.version.clawManifestSummary ?? null,
-          verification,
-          artifact: toReleaseArtifact(result.version, result.package.name),
-          sha256hash: result.version.sha256hash ?? null,
-          vtAnalysis: result.version.vtAnalysis ?? null,
-          skillSpectorAnalysis: result.version.skillSpectorAnalysis ?? null,
-          llmAnalysis: result.version.llmAnalysis ?? null,
-          staticScan: result.version.staticScan ?? null,
-        },
+        version: toPackageVersionResponse(result.version, result.package.name),
       },
       200,
       rate.headers,
@@ -4683,14 +4761,13 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
     if (!path) return text("Missing path", 400, rate.headers);
     const preview = requestUrl.searchParams.get("preview") === "1";
     if (skillDetail?.skill) {
-      const version = await getSkillVersionForRequest(ctx, skillDetail.skill, request);
-      if (!version || version.softDeletedAt) return text("Version not found", 404, rate.headers);
-      const effectiveLatestVersionId =
-        skillDetail.skill.latestVersionId ?? skillDetail.skill.tags?.latest;
+      const selection = await getSkillVersionForRequest(ctx, skillDetail.skill, request);
+      if (selection.status !== "available") return text("Version not found", 404, rate.headers);
+      const { skill, version } = selection;
       const moderationBlock = getPublicSkillVersionDownloadBlock(
-        skillDetail.moderationInfo,
+        getSkillFileModerationInfoFromSkill(skill),
         version,
-        effectiveLatestVersionId,
+        skill.latestVersionId ?? skill.tags?.latest,
       );
       if (moderationBlock)
         return text(moderationBlock.message, moderationBlock.status, rate.headers);
@@ -4721,27 +4798,14 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
         headers: rate.headers,
       });
     }
-    const release = await getReleaseForRequest(ctx, publicPackage!, request);
+    const release = await getReleaseForRequest(
+      ctx,
+      publicPackage!,
+      request,
+      viewerUserId ?? undefined,
+    );
     if (!release) return text("Version not found", 404, rate.headers);
-    const securityBlock = getReleaseSecurityBlock(release);
-    if (securityBlock) return text(securityBlock.message, securityBlock.status, rate.headers);
-    const file = resolvePackageFilePath(release, path);
-    if (!file) return text("File not found", 404, rate.headers);
-    const maxBytes = preview ? MAX_RAW_FILE_BYTES : MAX_PUBLISH_FILE_BYTES;
-    if (file.size > maxBytes) return text("File too large", 413, rate.headers);
-    const blob = await ctx.storage.get(file.storageId);
-    if (!blob) return text("File not found", 404, rate.headers);
-    const responseParams = {
-      blob,
-      path: file.path,
-      contentType: file.contentType,
-      sha256: file.sha256,
-      size: file.size,
-      headers: rate.headers,
-    };
-    return preview
-      ? await safeStoredFilePreviewResponse(responseParams)
-      : await safeStoredFileResponse(responseParams);
+    return packageFileResponse(ctx, release, path, preview, rate.headers);
   }
 
   if (packageSegments[0] === "download") {
@@ -4761,7 +4825,12 @@ export async function packagesGetRouterV1Handler(ctx: ActionCtx, request: Reques
         headers: mergeHeaders(rate.headers, { Location: url.toString() }, corsHeaders()),
       });
     }
-    const release = await getReleaseForRequest(ctx, publicPackage!, request);
+    const release = await getReleaseForRequest(
+      ctx,
+      publicPackage!,
+      request,
+      viewerUserId ?? undefined,
+    );
     if (!release) return text("Version not found", 404, rate.headers);
     const securityBlock = getReleaseSecurityBlock(release);
     if (securityBlock) return text(securityBlock.message, securityBlock.status, rate.headers);

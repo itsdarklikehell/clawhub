@@ -55,6 +55,9 @@ export type PackageCompatibility = (typeof PackageCompatibilitySchema)[inferred]
 
 export const PluginManifestSummarySchema = type({
   schemaVersion: "number",
+  contracts: type({ "[string]": "string[]" }).optional(),
+  providers: "string[]?",
+  channels: "string[]?",
   categories: "string[]?",
   icon: "string?",
   compatibility: PackageCompatibilitySchema.optional(),
@@ -678,6 +681,14 @@ export const ApiV1PackageSecurityResponseSchema = type({
   }),
 });
 export type ApiV1PackageSecurityResponse = (typeof ApiV1PackageSecurityResponseSchema)[inferred];
+
+export const ApiV1PluginDetailResponseSchema = ApiV1PackageResponseSchema.and({
+  versions: ApiV1PackageVersionListResponseSchema,
+  version: ApiV1PackageVersionResponseSchema.get("version"),
+  readme: "string|null",
+  security: ApiV1PackageSecurityResponseSchema.or("null"),
+});
+export type ApiV1PluginDetailResponse = (typeof ApiV1PluginDetailResponseSchema)[inferred];
 
 export const PackageReleaseModerationRequestSchema = type({
   state: PackageReleaseModerationStateSchema,

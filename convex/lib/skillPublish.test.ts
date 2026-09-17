@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { getFunctionName } from "convex/server";
 import { describe, expect, it, vi } from "vitest";
 import { MAX_PUBLISH_FILE_BYTES } from "./publishLimits";
 import {
@@ -13,6 +14,77 @@ vi.mock("./embeddings", () => ({
 }));
 
 describe("skillPublish", () => {
+  it.each([
+    { staged: false, failure: "insert" },
+    { staged: true, failure: "insert" },
+    { staged: false, failure: "followup" },
+    { staged: true, failure: "attempt" },
+    { staged: true, failure: "none" },
+  ])("transfers file ownership at persistence ($staged, $failure)", async ({ staged, failure }) => {
+    const events: string[] = [];
+    const markdown = "---\ndescription: Verify durable upload ownership.\n---\n# Ownership proof\n";
+    const ctx = {
+      runQuery: vi.fn(async (ref: Parameters<typeof getFunctionName>[0]) =>
+        getFunctionName(ref) === "users:getByIdInternal"
+          ? { _id: "users:1", handle: "demo", createdAt: 1 }
+          : null,
+      ),
+      runMutation: vi.fn(async (ref: Parameters<typeof getFunctionName>[0]) => {
+        const name = getFunctionName(ref);
+        if (name === "skills:insertVersion") {
+          events.push("insert");
+          if (failure === "insert") throw new Error("insert rejected");
+          return { skillId: "skills:demo", versionId: "skillVersions:demo" };
+        }
+        if (name === "publishAttempts:createSkillPublishAttemptInternal") {
+          events.push("attempt");
+          if (failure === "attempt") throw new Error("attempt failed");
+          return { attemptId: "publishAttempts:demo", status: "pending_checks" };
+        }
+        if (name === "skills:discardPendingPublicationInternal") events.push("discard");
+        return null;
+      }),
+      scheduler: {
+        runAfter: vi.fn(async () => {
+          throw new Error("followup failed");
+        }),
+      },
+      storage: { get: vi.fn(async () => new Blob([markdown])) },
+    };
+    const result = publishVersionForUser(
+      ctx as never,
+      "users:1" as never,
+      {
+        slug: "ownership-proof",
+        displayName: "Ownership Proof",
+        version: "1.0.0",
+        changelog: "Initial release",
+        files: [file("_storage:skill", "SKILL.md", markdown.length, "text/markdown")],
+      },
+      {
+        bypassGitHubAccountAge: true,
+        bypassQualityGate: true,
+        skipWebhook: true,
+        stagePrePublicationChecks: staged,
+        onFilesPersisted: () => {
+          events.push("persisted");
+        },
+      },
+    );
+    if (failure === "none") await expect(result).resolves.toMatchObject({ status: "pending" });
+    else
+      await expect(result).rejects.toThrow(
+        failure === "insert" ? "insert rejected" : `${failure} failed`,
+      );
+    expect(events).toEqual(
+      failure === "insert"
+        ? ["insert"]
+        : staged
+          ? ["insert", "persisted", "attempt", ...(failure === "attempt" ? ["discard"] : [])]
+          : ["insert", "persisted"],
+    );
+  });
+
   it("normalizes agents/openai.yaml presentation metadata and hosts its icon", async () => {
     const skillMarkdown =
       "---\nname: Demo Skill\ndescription: SKILL.md summary.\n---\n# Demo Skill\n";

@@ -26,19 +26,19 @@ export const PLUGIN_CATEGORY_DEFINITIONS = [
         slug: "channels",
         label: "Channels",
         icon: "message-circle",
-        description: "Human-agent messaging transports and channel adapters. Choose this when the main purpose is letting people talk to the agent through a messaging service, even if the adapter also exposes workspace tools.",
+        description: "Providing the main conversational transport between people and the agent through a messaging service, even if it also exposes workspace tools. Reply notifications, approval interfaces, inbox triage, and communication enhancements belong in Inbox & collaboration. A secondary channel capability does not override a different main purpose.",
     },
     {
         slug: "models",
         label: "Models",
         icon: "brain",
-        description: "General model providers, inference backends, and model routing. Agent execution engines belong in Agent runtimes; specialized speech or media generators belong in Voice or Media when that is their main purpose.",
+        description: "Providing inference backends, or selecting and routing which model/provider handles inference as the main service. The selected backend may execute the request. Incidental budget guards, usage reports, or optional fallback advice belong to their own workflow. Selecting and formatting tools for an existing model belongs in Context; specialized speech or media generators belong in Voice or Media.",
     },
     {
         slug: "agent-runtimes",
         label: "Agent runtimes",
         icon: "bot",
-        description: "Agent execution engines and backends that run model/tool loops and manage native sessions, including Codex, ACP, and Copilot runtimes. Context assembly belongs in Context; coordinating work across agents belongs in Agent orchestration.",
+        description: "Agent execution engines and backends that provide the agent model/tool loop and native session lifecycle, including Codex, ACP, and Copilot runtimes. A tool that invokes a separately running coding agent for a development task belongs in Developer tools; coordinating agents belongs in Agent orchestration.",
     },
     {
         slug: "memory",
@@ -50,7 +50,7 @@ export const PLUGIN_CATEGORY_DEFINITIONS = [
         slug: "context",
         label: "Context",
         icon: "book-open",
-        description: "Building, selecting, compacting, or managing the active conversation context. Durable memory belongs in Memory; an engine that runs the agent and owns its native sessions belongs in Agent runtimes.",
+        description: "Building, selecting, compacting, or managing the active conversation context, including selecting and formatting the tools presented to the model. Durable memory belongs in Memory; an engine that runs the agent and owns its native sessions belongs in Agent runtimes.",
     },
     {
         slug: "voice",
@@ -80,7 +80,7 @@ export const PLUGIN_CATEGORY_DEFINITIONS = [
         slug: "integrations",
         label: "Integrations",
         icon: "plug",
-        description: "General connectors, API bridges, and service integration platforms without a more specific user purpose. A connector to a particular workflow belongs in that workflow's category; exposing tools or MCP is not enough.",
+        description: "General-purpose platforms or reusable clients that let users choose which services, APIs, or MCP servers to connect. A fixed-service adapter belongs with its service's known workflow, or Other if that purpose is not established. Configuring credentials or an executable path does not make a fixed-service adapter general-purpose.",
     },
     {
         slug: "developer-tools",
@@ -104,13 +104,13 @@ export const PLUGIN_CATEGORY_DEFINITIONS = [
         slug: "inbox-collaboration",
         label: "Inbox & collaboration",
         icon: "inbox",
-        description: "Managing email, inboxes, team communication, and collaborative workspaces. Providing a transport for people to talk to the agent belongs in Channels.",
+        description: "Managing email, inboxes, team communication, and collaborative workspaces, including reply notifications, message triage, and communication personas over existing channels. Providing the messaging transport itself belongs in Channels.",
     },
     {
         slug: "productivity",
         label: "Productivity",
         icon: "list-todo",
-        description: "Managing tasks, notes, projects, plans, and personal or team work. Appointments and availability belong in Scheduling; document processing belongs in Documents & files.",
+        description: "Managing tasks, notes, projects, plans, and personal or team work, including reviewing work activity and history. Appointments and availability belong in Scheduling; document processing belongs in Documents & files.",
     },
     {
         slug: "scheduling",
@@ -152,7 +152,7 @@ export const PLUGIN_CATEGORY_DEFINITIONS = [
         slug: "other",
         label: "Other",
         icon: "package",
-        description: "Use only when the plugin's main purpose does not fit another category or the available evidence is insufficient. Do not use this just because a plugin has several capabilities.",
+        description: "Use only when the evidence does not establish a main purpose or that purpose does not reasonably fit any broader category. Category descriptions give examples, not exhaustive specialty lists; a missing exact specialty label or several capabilities is not a reason to use Other.",
     },
 ];
 // Published metadata and old category URLs must remain readable during reclassification.

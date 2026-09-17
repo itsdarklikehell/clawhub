@@ -12,6 +12,7 @@ import { requireApiTokenUser, requirePackagePublishAuth } from "../lib/apiTokenA
 import { corsHeaders, mergeHeaders } from "../lib/httpHeaders";
 import { getPublishFileSizeError, MAX_PUBLISH_FILE_BYTES } from "../lib/publishLimits";
 import { isMacJunkPath } from "../lib/skills";
+import type { PublicSkillVersionSelection } from "../lib/skills/publicVersions";
 export { getPathSegments, parsePackagePathSegments } from "../lib/httpPathSegments";
 
 export const MAX_RAW_FILE_BYTES = 200 * 1024;
@@ -281,76 +282,60 @@ export function toOptionalNumber(value: string | null) {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
-type LatestVersionTag =
-  | {
-      _id: Id<"skillVersions">;
-      version?: string;
-      softDeletedAt?: unknown;
-      skillId?: Id<"skills">;
+/** Batch checked selections without one action RPC per catalog item. */
+export async function readPublicSkillVersionSelections(
+  ctx: ActionCtx,
+  selections: Array<{ skillId: Id<"skills">; versionId: Id<"skillVersions"> }>,
+): Promise<PublicSkillVersionSelection[]> {
+  const results: PublicSkillVersionSelection[] = [];
+  // A selection reads two potentially large documents; keep each transaction
+  // below the read-byte limit even for near-limit version file manifests.
+  const batchSize = 5;
+  for (let offset = 0; offset < selections.length; offset += batchSize * 4) {
+    const batches: Array<Promise<PublicSkillVersionSelection[]>> = [];
+    for (
+      let start = offset;
+      start < Math.min(selections.length, offset + batchSize * 4);
+      start += batchSize
+    ) {
+      batches.push(
+        ctx.runQuery(internal.skills.getPublicVersionSelectionsInternal, {
+          selections: selections.slice(start, start + batchSize),
+        }),
+      );
     }
-  | null
-  | undefined;
+    for (const batch of await Promise.all(batches)) results.push(...batch);
+  }
+  return results;
+}
 
-/**
- * Batch resolve version tags to version strings.
- * Collects all version IDs, fetches them in a single query, then maps back.
- *
- * Notes:
- * - Uses `internal.*` queries to avoid expanding the public Convex API surface.
- * - Sorts ids for stable query args (helps caching/log diffs).
- */
+/** Resolve every tag through current documents; cached summaries omit lifecycle state. */
 export async function resolveTagsBatch(
   ctx: ActionCtx,
   tagsList: Array<Record<string, Id<"skillVersions">>>,
-  latestVersions: Array<LatestVersionTag>,
   skillIds: Array<Id<"skills">>,
 ): Promise<Array<Record<string, string>>> {
-  const allVersionIds = new Set<Id<"skillVersions">>();
-  const preResolvedTags = tagsList.map((tags, idx) => {
-    const resolved: Record<string, string> = {};
-    const latest = latestVersions[idx];
-    const skillId = skillIds[idx];
-    for (const [tag, versionId] of Object.entries(tags)) {
-      if (
-        latest?._id === versionId &&
-        latest.version &&
-        !latest.softDeletedAt &&
-        latest.skillId === skillId
-      ) {
-        resolved[tag] = latest.version;
-      } else {
-        allVersionIds.add(versionId);
-      }
-    }
-    return resolved;
+  const selections = new Map<string, { skillId: Id<"skills">; versionId: Id<"skillVersions"> }>();
+  const selectionKey = (skillId: Id<"skills">, versionId: Id<"skillVersions">) =>
+    `${skillId}/${versionId}`;
+  tagsList.forEach((tags, index) => {
+    const skillId = skillIds[index];
+    for (const versionId of Object.values(tags))
+      selections.set(selectionKey(skillId, versionId), { skillId, versionId });
   });
-
-  if (allVersionIds.size === 0) {
-    return preResolvedTags;
-  }
-
-  const versionIds = [...allVersionIds].sort();
-  const versions =
-    (await ctx.runQuery(internal.skills.getVersionsByIdsInternal, { versionIds })) ?? [];
-
-  const versionMap = new Map<
-    Id<"skillVersions">,
-    {
-      version: string;
-      skillId?: Id<"skills">;
-    }
-  >();
-  for (const v of versions) {
-    if (!v?.softDeletedAt) versionMap.set(v._id, { version: v.version, skillId: v.skillId });
-  }
-
-  return tagsList.map((tags, idx) => {
-    const resolved = { ...preResolvedTags[idx] };
-    const skillId = skillIds[idx];
+  const keys = [...selections.keys()].sort();
+  const selected = await readPublicSkillVersionSelections(
+    ctx,
+    keys.map((key) => selections.get(key)!),
+  );
+  const selectionMap = new Map(keys.map((key, index) => [key, selected[index]]));
+  return tagsList.map((tags, index) => {
+    const resolved: Record<string, string> = {};
     for (const [tag, versionId] of Object.entries(tags)) {
-      if (resolved[tag]) continue;
-      const version = versionMap.get(versionId);
-      if (version?.skillId === skillId) resolved[tag] = version.version;
+      const selection = selectionMap.get(selectionKey(skillIds[index], versionId));
+      // A published target can outlive a removed or repointed tag in a cached snapshot.
+      if (selection?.status === "available" && selection.skill.tags[tag] === versionId)
+        resolved[tag] = selection.version.version;
     }
     return resolved;
   });
@@ -386,6 +371,13 @@ function toFileLike(entry: FormDataEntryValue): FileLikeEntry | null {
   return entry as FileLikeEntry;
 }
 
+export async function deleteStoredMultipartFiles(
+  ctx: ActionCtx,
+  files: Array<{ storageId: Id<"_storage"> }>,
+) {
+  await Promise.allSettled(files.map((file) => ctx.storage.delete(file.storageId)));
+}
+
 export async function parseMultipartPublish(
   ctx: ActionCtx,
   request: Request,
@@ -402,6 +394,14 @@ export async function parseMultipartPublish(
     throw new Error("Invalid JSON payload");
   }
 
+  const fileEntries = form
+    .getAll("files")
+    .map((entry) => toFileLike(entry))
+    .filter((file): file is FileLikeEntry => Boolean(file))
+    .filter((file) => !isMacJunkPath(file.name));
+  const oversized = fileEntries.find((file) => file.size > MAX_PUBLISH_FILE_BYTES);
+  if (oversized) throw new Error(getPublishFileSizeError(oversized.name));
+
   const files: Array<{
     path: string;
     size: number;
@@ -410,44 +410,47 @@ export async function parseMultipartPublish(
     contentType?: string;
   }> = [];
 
-  for (const entry of form.getAll("files")) {
-    const file = toFileLike(entry);
-    if (!file) continue;
-    const path = file.name;
-    if (isMacJunkPath(path)) continue;
-    const size = file.size;
-    if (size > MAX_PUBLISH_FILE_BYTES) {
-      throw new Error(getPublishFileSizeError(path));
+  try {
+    for (const file of fileEntries) {
+      const path = file.name;
+      const size = file.size;
+      const contentType = file.type || undefined;
+      const buffer = new Uint8Array(await file.arrayBuffer());
+      const sha256 = await sha256Hex(buffer);
+      const storageId = await ctx.storage.store(file as Blob);
+      files.push({ path, size, storageId, sha256, contentType });
     }
-    const contentType = file.type || undefined;
-    const buffer = new Uint8Array(await file.arrayBuffer());
-    const sha256 = await sha256Hex(buffer);
-    const storageId = await ctx.storage.store(file as Blob);
-    files.push({ path, size, storageId, sha256, contentType });
+
+    const forkOf =
+      payload.forkOf && typeof payload.forkOf === "object" ? payload.forkOf : undefined;
+    const hasAcceptLicenseTerms = Object.prototype.hasOwnProperty.call(
+      payload,
+      "acceptLicenseTerms",
+    );
+    const body = {
+      slug: payload.slug,
+      displayName: payload.displayName,
+      ...(typeof payload.ownerHandle === "string" ? { ownerHandle: payload.ownerHandle } : {}),
+      ...(typeof payload.sourceOwnerHandle === "string"
+        ? { sourceOwnerHandle: payload.sourceOwnerHandle }
+        : {}),
+      ...(typeof payload.migrateOwner === "boolean" ? { migrateOwner: payload.migrateOwner } : {}),
+      version: payload.version,
+      changelog: typeof payload.changelog === "string" ? payload.changelog : "",
+      ...(hasAcceptLicenseTerms ? { acceptLicenseTerms: payload.acceptLicenseTerms } : {}),
+      tags: Array.isArray(payload.tags) ? payload.tags : undefined,
+      ...(Array.isArray(payload.categories) ? { categories: payload.categories } : {}),
+      ...(Array.isArray(payload.topics) ? { topics: payload.topics } : {}),
+      ...(payload.source ? { source: payload.source } : {}),
+      files,
+      ...(forkOf ? { forkOf } : {}),
+    };
+
+    return parsePublishBody(body);
+  } catch (error) {
+    await deleteStoredMultipartFiles(ctx, files);
+    throw error;
   }
-
-  const forkOf = payload.forkOf && typeof payload.forkOf === "object" ? payload.forkOf : undefined;
-  const hasAcceptLicenseTerms = Object.prototype.hasOwnProperty.call(payload, "acceptLicenseTerms");
-  const body = {
-    slug: payload.slug,
-    displayName: payload.displayName,
-    ...(typeof payload.ownerHandle === "string" ? { ownerHandle: payload.ownerHandle } : {}),
-    ...(typeof payload.sourceOwnerHandle === "string"
-      ? { sourceOwnerHandle: payload.sourceOwnerHandle }
-      : {}),
-    ...(typeof payload.migrateOwner === "boolean" ? { migrateOwner: payload.migrateOwner } : {}),
-    version: payload.version,
-    changelog: typeof payload.changelog === "string" ? payload.changelog : "",
-    ...(hasAcceptLicenseTerms ? { acceptLicenseTerms: payload.acceptLicenseTerms } : {}),
-    tags: Array.isArray(payload.tags) ? payload.tags : undefined,
-    ...(Array.isArray(payload.categories) ? { categories: payload.categories } : {}),
-    ...(Array.isArray(payload.topics) ? { topics: payload.topics } : {}),
-    ...(payload.source ? { source: payload.source } : {}),
-    files,
-    ...(forkOf ? { forkOf } : {}),
-  };
-
-  return parsePublishBody(body);
 }
 
 export async function parseMultipartSkillScan(
@@ -508,7 +511,7 @@ export async function parseMultipartSkillScan(
       files.push({ path, size, storageId, sha256, contentType });
     }
   } catch (error) {
-    await Promise.allSettled(files.map((file) => ctx.storage.delete(file.storageId)));
+    await deleteStoredMultipartFiles(ctx, files);
     throw error;
   }
 
@@ -591,6 +594,7 @@ export function cleanUserFacingErrorMessage(message: string) {
   let cleaned = message
     .replace(/\[CONVEX[^\]]*\]\s*/g, "")
     .replace(/\[Request ID:[^\]]*\]\s*/g, "")
+    .replace(/\n\s+at [\s\S]*$/, "")
     .replace(/^Server Error Called by client\s*/i, "")
     .trim();
 

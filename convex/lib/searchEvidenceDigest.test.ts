@@ -15,6 +15,11 @@ const catalog = (): DigestCatalogInput => ({
   },
   adoption: {
     status: "available",
+    collectionStartedAt: weekEnd + 86_400_000,
+    periodStart7d: weekEnd - 7 * 86_400_000,
+    scannedRows: 1,
+    importedRows: 0,
+    importDatasetVersions: [],
     generatedAt: weekEnd + 86_400_000,
     periodStart: weekEnd,
     periodEnd: weekEnd + 86_400_000,
@@ -48,10 +53,26 @@ const catalog = (): DigestCatalogInput => ({
     },
   ],
   recommendations: {
+    lineup: {
+      targetSize: 16,
+      baseline: [],
+      proposed: [],
+      removals: [],
+      shortfall: 16,
+      reservedSlots: 0,
+      telemetryTarget: 16,
+      pendingCount: 0,
+      telemetryShortfall: 16,
+      editorialRevision: 0,
+      currentEditorialRevision: 0,
+      staleEditorial: false,
+      reservations: [],
+    },
     omittedCandidates: 0,
     candidates: [
       {
         artifactKind: "plugin",
+        version: "1.0.0",
         id: "plugin:memory",
         displayName: "Memory",
         url: "/plugins/memory",
@@ -79,18 +100,12 @@ const catalog = (): DigestCatalogInput => ({
           collectionStartedAt: weekEnd - 604_800_000,
         },
         adoption: {
-          source: "package-trending",
+          source: "package-daily-installs",
           rank: 2,
-          snapshotId: "latest",
-          rankingVersion: "v1",
-          periodStart: weekEnd,
-          periodEnd: weekEnd + 86_400_000,
-          generatedAt: weekEnd + 86_400_000,
-          sourceObservedAt: null,
-          downloads: 341,
-          installs: 1,
-          bookmarks: null,
-          lifetimeInstalls: null,
+          installs30d: 341,
+          installs7d: 1,
+          importedRows: 0,
+          importDatasetVersions: [],
         },
       },
     ],
@@ -100,14 +115,46 @@ const build = (
   plugins = catalog(),
   skills: DigestCatalogInput = {
     ...catalog(),
-    recommendations: { candidates: [], omittedCandidates: 0 },
+    recommendations: {
+      candidates: [],
+      omittedCandidates: 0,
+      lineup: {
+        targetSize: 16,
+        baseline: [],
+        proposed: [],
+        removals: [],
+        shortfall: 16,
+        reservedSlots: 0,
+        telemetryTarget: 16,
+        pendingCount: 0,
+        telemetryShortfall: 16,
+        editorialRevision: 0,
+        currentEditorialRevision: 0,
+        staleEditorial: false,
+        reservations: [],
+      },
+    },
   },
-) =>
-  buildSearchEvidenceDigest({
+) => {
+  for (const input of [plugins, skills]) {
+    input.recommendations.lineup.proposed = input.recommendations.candidates.map(
+      (candidate, index) => ({
+        ...candidate,
+        slot: index,
+        selectionBasis: "telemetry",
+        reason: "Recorded monthly installs",
+        change: "add",
+        emerging: false,
+      }),
+    );
+    input.recommendations.lineup.shortfall = 16 - input.recommendations.lineup.proposed.length;
+  }
+  return buildSearchEvidenceDigest({
     weekEnd,
     siteUrl: "https://clawhub.ai",
     catalogs: { plugins, skills },
   });
+};
 
 it("projects both catalogs, separate periods and scoped demand without leaking identities or rare query text", () => {
   const plugins = catalog();
@@ -123,10 +170,7 @@ it("projects both catalogs, separate periods and scoped demand without leaking i
       search: null,
       adoption: {
         ...plugins.recommendations.candidates[0].adoption!,
-        source: "skills-sh-trending",
-        periodStart: null,
-        periodEnd: null,
-        sourceObservedAt: weekEnd - 86_400_000,
+        source: "skill-daily-installs",
       },
     },
   ];
@@ -138,7 +182,7 @@ it("projects both catalogs, separate periods and scoped demand without leaking i
   });
   expect(digest.catalogs.skills.recommendations[0]).toMatchObject({
     search: null,
-    adoption: { sourceObservedAt: weekEnd - 86_400_000, periodStart: null, periodEnd: null },
+    adoption: { source: "skill-daily-installs", installs30d: 341, installs7d: 1 },
   });
   expect(digest.catalogs.skills.companyOpportunities).toHaveLength(1);
   expect(digest.catalogs.skills.officialGaps).toHaveLength(2);
@@ -152,7 +196,7 @@ it("projects both catalogs, separate periods and scoped demand without leaking i
   expect(plugins.recommendations.candidates[0].search?.queries).toHaveLength(3);
 });
 
-it("retains canonical candidate order, suppresses low-volume search-only candidates and shows adoption with low demand", () => {
+it("retains canonical candidate order, preserves the full selection while suppressing rare query text", () => {
   const input = catalog();
   const base = input.recommendations.candidates[0];
   input.recommendations.candidates = [
@@ -183,6 +227,7 @@ it("retains canonical candidate order, suppresses low-volume search-only candida
   const digest = build(input);
   expect(digest.catalogs.plugins.recommendations.map((row) => row.id)).toEqual([
     "plugin:z-first",
+    "plugin:excluded",
     "plugin:a-next",
   ]);
   expect(digest.catalogs.plugins.recommendations[0].search).toMatchObject({
@@ -190,7 +235,7 @@ it("retains canonical candidate order, suppresses low-volume search-only candida
     queries: [],
     omittedQueries: 1,
   });
-  expect(digest.truncated).toBe(true);
+  expect(JSON.stringify(digest)).not.toContain("rare private text");
 });
 
 it("bounds sections and UTF-8 while preserving leading rows from each catalog and explicit omissions", () => {
@@ -201,24 +246,25 @@ it("bounds sections and UTF-8 while preserving leading rows from each catalog an
     searchUrl: `/plugins?q=${encodeURIComponent("界".repeat(190) + index)}`,
   }));
   input.moverRows = input.rows;
-  input.recommendations.candidates = Array.from({ length: 6 }, (_, index) => ({
+  input.recommendations.candidates = Array.from({ length: 16 }, (_, index) => ({
     ...input.recommendations.candidates[0],
     id: `plugin:item-${index}`,
-    url: `/plugins/item-${index}?q=${"x".repeat(1700)}`,
+    url: `/plugins/item-${index}?q=${"x".repeat(50)}`,
   }));
   const skills = structuredClone(input);
   skills.recommendations.candidates = skills.recommendations.candidates.map((row) => ({
     ...row,
     artifactKind: "skill",
     id: row.id.replace("plugin:", "clawhub:"),
-    adoption: { ...row.adoption!, source: "clawhub-trending" },
+    adoption: { ...row.adoption!, source: "skill-daily-installs" },
   }));
   const result = build(input, skills);
   expect(new TextEncoder().encode(JSON.stringify(result)).byteLength).toBeLessThanOrEqual(30_000);
   expect(result.truncated).toBe(true);
   for (const value of Object.values(result.catalogs)) {
-    expect(value.recommendations.length).toBeGreaterThan(0);
-    expect(value.recommendations.length).toBeLessThanOrEqual(5);
+    expect(value.recommendations).toHaveLength(16);
+    expect(value.lineup.changes).toHaveLength(16);
+    expect(value.lineup.shortfall).toBe(0);
     expect(value.recommendations[0].id).toContain("item-0");
   }
   expect(build(input, skills)).toEqual(result);
@@ -234,7 +280,7 @@ it("keeps deterministic gaps on classifier failure and independently checked ado
   expect(output.officialGaps.map((row) => row.query)).toEqual(["notion"]);
   expect(output.recommendations.map((row) => row.id)).toEqual(["plugin:memory"]);
   input.metadataCheckedAt = null;
-  expect(build(input).catalogs.plugins.recommendations).toEqual([]);
+  expect(() => build(input)).toThrow("complete Featured selection cannot be represented");
 });
 
 it("preserves same-query catalog, shelf and legacy evidence while limiting company opportunities to the catalog", () => {
@@ -270,4 +316,11 @@ it("preserves same-query catalog, shelf and legacy evidence while limiting compa
   expect(output.movers.map((row) => row.scope)).toEqual(scopes);
   expect(output.recommendations[0].search?.queries.map((row) => row.scope)).toEqual(scopes);
   expect(output.companyOpportunities.map((row) => row.scope)).toEqual(["catalog"]);
+});
+
+it("fails explicitly instead of dropping an unrepresentable selected identity", () => {
+  const input = catalog();
+  input.recommendations.candidates[0].id = "plugin:" + "x".repeat(256);
+  expect(() => build(input)).toThrow("complete Featured selection cannot be represented");
+  expect(input.recommendations.candidates).toHaveLength(1);
 });

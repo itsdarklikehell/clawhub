@@ -167,15 +167,29 @@ first failed batch drains.
 ### Local bulk scan assignments
 
 `skills plan-scan-workers` prepares workflow inputs locally from **existing admitted
-job IDs**, split across the nine shared shards. It does not admit scans, dispatch
+job IDs**, split across nine shared shards by default. `--shared-workers 18`
+spreads them across eighteen machines independently of `--batch-limit`, which
+controls concurrent scans on each machine. It does not admit scans, dispatch
 workers, change capacity automatically, or store campaign state on the server.
-The reserved priority shard continues processing its normal queue.
+Assigned shared workers use separate concurrency groups from ordinary queue
+workers. The reserved priority shard keeps its existing group and normal queue.
+When upgrading from a worker release that shared the ordinary groups, drain
+assigned workers and pending assigned dispatches before switching releases.
 
 ```sh
 bun run admin -- skills plan-scan-workers queued-job-ids.json --batch-limit 32 > worker-plan.json
 # After validating the worker/backend release and the capacity probe:
 jq '.inputs' worker-plan.json | gh workflow run security-scan-codex.yml --repo openclaw/clawhub --ref main --json
 ```
+
+To compare machine fan-out without doubling total scan concurrency, compare
+nine workers at `--batch-limit 64` with eighteen at `--batch-limit 32`.
+Drain the old shared worker pool and stop pending old-pool dispatches before
+changing the worker count: changing the pool changes job-to-shard ownership.
+Keep admission receipts and queued IDs, then refresh status and generate the
+new plan. Use the plan's complete `inputs` object with a matching worker release;
+mismatched assignment and worker counts fail before any shared job is claimed.
+The priority worker remains independent of bulk assignment validation.
 
 The input is a JSON array of 1–10000 `securityScanJobs` IDs from saved admission
 receipts. Refresh their status first using the admin batch-status API and collect
@@ -184,7 +198,7 @@ field; wait for the backend release instead of assigning all tracked IDs. Runnin
 completed, failed and missing jobs must not occupy the bounded dispatch payload. The output contains workflow `inputs` and explicit `deferredJobIds` for jobs
 that do not fit this dispatch. Keep these IDs in the local backlog for later
 dispatches; never replace or discard them. A dispatch selects at most 1,728 IDs
-in input order across nine disjoint assignments (fewer if longer IDs reach the
+in input order across the selected number of disjoint assignments (fewer if longer IDs reach the
 workflow input payload limit),
 with stable job-to-shard ownership across dispatches and at most 512 IDs per shard, and a twelve-minute claim window. An explicitly
 empty shard stays empty; it never falls back to unrelated jobs. Without assignments,
@@ -204,7 +218,8 @@ throughput. A 32 setting is a probe, not a claim of qualified capacity.
 ### Search intelligence
 
 Admins and moderators can read the same aggregate report as Management → Search
-intelligence. This is read-only and does not change Featured or Trending.
+intelligence. Reports are saved for 24 hours; creating or reading one does not change
+Featured or Trending.
 
 ```sh
 clawhub-admin search-insights
@@ -213,7 +228,20 @@ clawhub-admin search-insights --intent-kind company_product --json
 clawhub-admin search-insights --end-day 2026-09-07 --limit 100 --json
 clawhub-admin search-insights --view recommendations --artifact-kind plugin --json
 clawhub-admin search-insights --view recommendations --artifact-kind skill --json
+clawhub-admin search-insights --report-id <report-id> --json
+clawhub-admin search-insights --refresh <report-id> --json
 ```
+
+The command starts or reuses a saved report, prints its ID and progress to stderr,
+and stops polling after five minutes. An in-flight request can finish within its
+existing request/retry budget; each request keeps the normal 15-second limit.
+`--json` writes only the completed report to stdout. Ctrl+C or the wait limit stops
+this client from waiting; the server job continues. Resume with `--report-id`.
+Failed, incomplete or expired reports produce an error instead of partial JSON.
+Use `--refresh` to request a new generation with the same original view and filters;
+resume and refresh do not accept filter overrides. Matching requests reuse the saved
+generation, including a failed one, while its source evidence and time window remain
+unchanged and it has not expired. Use `--refresh` to request another attempt.
 
 Windows contain complete UTC days before `--end-day` (exclusive; defaults to today).
 Every response includes seven-day, previous-seven-day and 30-day counts. Source can
@@ -240,11 +268,29 @@ Adoption keeps its own exact period, generation time and original ranking. Packa
 Trending includes a partial current UTC day; native skill Trending uses completed
 hours. Unknown source periods and unavailable metrics remain null. Both views expose
 coverage limits and current metadata freshness. Candidate eligibility uses current
-public releases and security status, and excludes already Featured artifacts;
+public releases and security status. Channels, model providers and agent runtimes
+are excluded from plugin discovery using their canonical category; official and
+community workflow tools remain eligible. Current Featured entries are reassessed;
 external skills without a ClawHub Featured owner remain explicit exclusions.
 
+Every iteration proposes the complete set of up to eight plugins and eight skills,
+including retained selections, additions, removals, the current membership baseline,
+and any unfilled places. Current Featured members are checked even outside the
+inspected Trending/search cohort. Eligible members with no observed window evidence
+are labeled `current-only` and can fill remaining places; their missing evidence
+is not zero demand. An evidence-ranked replacement is not a safety finding.
+The quality floor is never lowered to fill eight places. The Emerging label reuses
+the public New tab's 14-day publication window with observed adoption, or the
+existing skill Rising feed with adoption; it does not claim accelerating growth.
+
+The weekly digest carries the same complete proposed membership. It shortens query
+details and other sections before dropping any selected identity; an unrepresentable
+selection fails explicitly. Publication remains a separate moderator action requiring
+Patrick's approval. Publishing a newly Featured skill can trigger its existing
+Featured notification; reading this report does not send it.
+
 For the first production dry run, use these read-only commands or Management →
-Search intelligence → Featured candidates. Do not invoke delivery, backfill request
+Search intelligence → Featured selection. Do not invoke delivery, backfill request
 logs, or change Featured. Review usefulness, quality, security and category coverage
 with Patrick before publishing a selection. An empty search window can still have
 adoption candidates; missing evidence is never replaced with sample recommendations.

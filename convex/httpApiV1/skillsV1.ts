@@ -69,8 +69,8 @@ import {
   getPublicSkillVersionAccessBlock,
   getPublicSkillVersionDownloadBlock,
   getSkillFileModerationInfoFromSkill,
-  isSkillVersionForSkill,
 } from "../lib/skillFileAccess";
+import type { PublicSkillVersionSelection } from "../lib/skills/publicVersions";
 import { normalizeSkillSlug } from "../lib/skillSlugValidator";
 import {
   buildDeterministicZip,
@@ -85,6 +85,7 @@ import {
   MAX_RAW_FILE_BYTES,
   type AmbiguousSkillSlugChoice,
   ambiguousSkillSlugResponse,
+  deleteStoredMultipartFiles,
   formatAuthzMessage,
   formatUserFacingErrorMessage,
   getPathSegments,
@@ -96,6 +97,7 @@ import {
   requireAdminOrResponse,
   requireApiTokenUserOrResponse,
   resolveTagsBatch,
+  readPublicSkillVersionSelections,
   safeStoredFilePreviewResponse,
   safeStoredFileResponse,
   safeTextFileResponse,
@@ -159,6 +161,7 @@ async function readRequestBodyWithinLimit(request: Request, maxBytes: number) {
 
 type ListSkillsResult = {
   items: Array<{
+    ownerHandle: string | null;
     skill: {
       _id: Id<"skills">;
       slug: string;
@@ -405,8 +408,6 @@ const internalRefs = internal as unknown as {
     getSecurityVerdictTargetInternal: unknown;
     getVerifyTargetBySlugInternal: unknown;
     getSkillBySlugInternal: unknown;
-    getVersionByIdInternal: unknown;
-    getVersionBySkillAndVersionInternal: unknown;
     hardDeleteForAdminInternal: unknown;
     reportSkillForUserInternal: unknown;
     listSkillReportsInternal: unknown;
@@ -1059,21 +1060,47 @@ function selectSkillReadmeFile(version: Doc<"skillVersions"> | null | undefined)
   });
 }
 
+async function readPublicSkillVersionSelection(
+  ctx: ActionCtx,
+  skillId: Id<"skills">,
+  selector: { version?: string; tag?: string; versionId?: Id<"skillVersions"> } = {},
+): Promise<PublicSkillVersionSelection> {
+  return await ctx.runQuery(internal.skills.getPublicVersionSelectionInternal, {
+    skillId,
+    ...selector,
+  });
+}
+
+function unavailableSkillVersionResponse(
+  selection: Exclude<PublicSkillVersionSelection, { status: "available" }>,
+  headers: HeadersInit,
+) {
+  return selection.status === "deleted"
+    ? text("Version not available", 410, headers)
+    : text("Version not found", 404, headers);
+}
+
 async function readSkillDescriptionMarkdown(
   ctx: ActionCtx,
   skillId: Id<"skills">,
   versionId: Id<"skillVersions"> | undefined,
 ) {
   if (versionId) {
-    const version = (await ctx.runQuery(internal.skills.getVersionByIdInternal, {
-      versionId,
-    })) as Doc<"skillVersions"> | null;
-    if (version && isSkillVersionForSkill(version, skillId) && !version.softDeletedAt) {
-      const file = selectSkillReadmeFile(version);
-      if (file && file.size <= MAX_RAW_FILE_BYTES) {
-        const blob = await ctx.storage.get(file.storageId);
-        if (blob) return await blob.text();
-      }
+    const selection = await readPublicSkillVersionSelection(ctx, skillId, { versionId });
+    if (selection.status !== "available") return null;
+    const { skill, version } = selection;
+    if (
+      getPublicSkillVersionDownloadBlock(
+        getSkillFileModerationInfoFromSkill(skill),
+        version,
+        skill.latestVersionId ?? skill.tags.latest,
+      )
+    )
+      return null;
+    const file = selectSkillReadmeFile(version);
+    if (file && file.size <= MAX_RAW_FILE_BYTES) {
+      const blob = await ctx.storage.get(file.storageId);
+      if (blob) return await blob.text();
     }
   }
 
@@ -1548,15 +1575,32 @@ export async function listSkillsV1Handler(ctx: ActionCtx, request: Request) {
     };
   }
 
-  // Batch resolve all tags in a single query instead of N queries
+  // Digest summaries may predate publication or owner-deletion transitions.
+  // Re-read the selected public snapshot, preserving older approved versions.
+  const latestTargets = result.items.filter((item) => item.latestVersion);
+  const latestSelections = await readPublicSkillVersionSelections(
+    ctx,
+    latestTargets.map((item) => ({
+      skillId: item.skill._id,
+      versionId: item.latestVersion!._id,
+    })),
+  );
+  let latestIndex = 0;
+  result.items = result.items.map((item) => {
+    if (!item.latestVersion) return item;
+    const selection = latestSelections[latestIndex++];
+    return { ...item, latestVersion: selection.status === "available" ? selection.version : null };
+  });
+
+  // Tag targets are checked in bounded batches rather than per-item action RPCs.
   const resolvedTagsList = await resolveTagsBatch(
     ctx,
     result.items.map((item) => item.skill.tags),
-    result.items.map((item) => item.latestVersion),
     result.items.map((item) => item.skill._id),
   );
 
   const items = result.items.map((item, idx) => ({
+    ownerHandle: item.ownerHandle,
     slug: item.skill.slug,
     displayName: item.skill.displayName,
     summary: item.skill.summary ?? null,
@@ -1756,33 +1800,21 @@ async function getUnavailableSkillVersionBlock(
   );
   if (!skill || skill.softDeletedAt) return null;
 
-  const latestVersionId = skill.latestVersionId ?? skill.tags?.latest;
-  const selectedVersionId = selector?.tagName ? skill.tags?.[selector.tagName] : latestVersionId;
-  if (!selector?.versionName && !selectedVersionId) return null;
-
-  const version = selector?.versionName
-    ? await runQueryRef<PublicSkillVersionResponse | null>(
-        ctx,
-        internalRefs.skills.getVersionBySkillAndVersionInternal,
-        {
-          skillId: skill._id,
-          version: selector.versionName,
-        },
-      )
-    : await runQueryRef<PublicSkillVersionResponse | null>(
-        ctx,
-        internalRefs.skills.getVersionByIdInternal,
-        {
-          versionId: selectedVersionId,
-        },
-      );
-  if (!version || !isSkillVersionForSkill(version, skill._id)) return null;
-  if (version.softDeletedAt) return { status: 410, message: "Version not available" };
-
+  const selection = await readPublicSkillVersionSelection(
+    ctx,
+    skill._id,
+    selector?.versionName
+      ? { version: selector.versionName }
+      : selector?.tagName
+        ? { tag: selector.tagName }
+        : {},
+  );
+  if (selection.status === "deleted") return { status: 410, message: "Version not available" };
+  if (selection.status !== "available") return null;
   return getPublicSkillVersionAccessBlock(
-    getSkillFileModerationInfoFromSkill(skill),
-    version._id,
-    skill.latestVersionId ?? skill.tags?.latest,
+    getSkillFileModerationInfoFromSkill(selection.skill),
+    selection.version._id,
+    selection.skill.latestVersionId ?? selection.skill.tags?.latest,
   );
 }
 
@@ -1942,12 +1974,7 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
       );
     }
 
-    const [tags] = await resolveTagsBatch(
-      ctx,
-      [result.skill.tags],
-      [result.latestVersion],
-      [result.skill._id],
-    );
+    const [tags] = await resolveTagsBatch(ctx, [result.skill.tags], [result.skill._id]);
     const latestVersionId =
       result.skill.latestVersionId ?? result.skill.tags?.latest ?? result.latestVersion?._id;
     const descriptionAccessBlock = result.latestVersion
@@ -2162,22 +2189,17 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
       );
     }
 
-    const version = (await ctx.runQuery(api.skills.getVersionBySkillAndVersion, {
-      skillId: skillResult.skill._id,
+    const selection = await readPublicSkillVersionSelection(ctx, skillResult.skill._id, {
       version: third,
-    })) as PublicSkillVersionResponse | null;
-    if (!version) return text("Version not found", 404, rate.headers);
-    if (version.softDeletedAt) return text("Version not available", 410, rate.headers);
-    const effectiveLatestVersionId =
-      skillResult.skill.latestVersionId ?? skillResult.skill.tags?.latest;
+    });
+    if (selection.status !== "available") return text("Version not found", 404, rate.headers);
+    const { skill: selectedSkill, version } = selection;
     const moderationBlock = getPublicSkillVersionAccessBlock(
-      skillResult.moderationInfo,
+      getSkillFileModerationInfoFromSkill(selectedSkill),
       version._id,
-      effectiveLatestVersionId,
+      selectedSkill.latestVersionId ?? selectedSkill.tags?.latest,
     );
-    if (moderationBlock) {
-      return text(moderationBlock.message, moderationBlock.status, rate.headers);
-    }
+    if (moderationBlock) return text(moderationBlock.message, moderationBlock.status, rate.headers);
     const security = buildSkillSecuritySnapshot(version);
 
     return json(
@@ -2227,49 +2249,33 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
       );
     }
 
-    let version = result.latestVersion;
-    if (versionParam) {
-      version = await ctx.runQuery(api.skills.getVersionBySkillAndVersion, {
-        skillId: result.skill._id,
-        version: versionParam,
-      });
-    } else if (tagParam) {
-      const versionId = result.skill.tags[tagParam];
-      if (versionId) {
-        version = await ctx.runQuery(api.skills.getVersionById, { versionId });
-      } else {
-        version = null;
-      }
-    }
-
-    if (!version || !isSkillVersionForSkill(version, result.skill._id)) {
-      return text("Version not found", 404, rate.headers);
-    }
-    if (version.softDeletedAt) return text("Version not available", 410, rate.headers);
-
-    const effectiveLatestVersionId = result.skill.latestVersionId ?? result.skill.tags?.latest;
-    const moderationBlock = getPublicSkillVersionAccessBlock(
-      result.moderationInfo,
-      version._id,
-      effectiveLatestVersionId,
+    const selection = await readPublicSkillVersionSelection(
+      ctx,
+      result.skill._id,
+      versionParam ? { version: versionParam } : tagParam ? { tag: tagParam } : {},
     );
-    if (moderationBlock) {
-      return text(moderationBlock.message, moderationBlock.status, rate.headers);
-    }
+    if (selection.status !== "available") return text("Version not found", 404, rate.headers);
+    const { skill: selectedSkill, version } = selection;
+    const selectedModerationInfo = getSkillFileModerationInfoFromSkill(selectedSkill);
+    const moderationBlock = getPublicSkillVersionAccessBlock(
+      selectedModerationInfo,
+      version._id,
+      selectedSkill.latestVersionId ?? selectedSkill.tags?.latest,
+    );
+    if (moderationBlock) return text(moderationBlock.message, moderationBlock.status, rate.headers);
 
-    let moderationSourceVersion: PublicSkillVersionResponse | null = result.latestVersion;
-    const moderationSourceVersionId = result.moderationInfo?.sourceVersionId;
-    if (moderationSourceVersionId) {
-      if (version._id === moderationSourceVersionId) {
-        moderationSourceVersion = version;
-      } else if (result.latestVersion?._id !== moderationSourceVersionId) {
-        const sourceVersion = (await ctx.runQuery(api.skills.getVersionById, {
-          versionId: moderationSourceVersionId,
-        })) as PublicSkillVersionResponse | null;
-        moderationSourceVersion = isSkillVersionForSkill(sourceVersion, result.skill._id)
-          ? sourceVersion
-          : null;
-      }
+    let moderationSourceVersion: Doc<"skillVersions"> | null = null;
+    const moderationSourceVersionId =
+      selectedSkill.moderationSourceVersionId ??
+      selectedSkill.latestVersionId ??
+      selectedSkill.tags?.latest;
+    if (moderationSourceVersionId === version._id) {
+      moderationSourceVersion = version;
+    } else if (moderationSourceVersionId) {
+      const source = await readPublicSkillVersionSelection(ctx, selectedSkill._id, {
+        versionId: moderationSourceVersionId,
+      });
+      if (source.status === "available") moderationSourceVersion = source.version;
     }
     const security = buildSkillSecuritySnapshot(version);
     const moderationMatchesRequestedVersion = Boolean(
@@ -2297,11 +2303,11 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
                   }
                 : null,
               matchesRequestedVersion: moderationMatchesRequestedVersion,
-              isPendingScan: result.moderationInfo.isPendingScan ?? false,
-              isMalwareBlocked: result.moderationInfo.isMalwareBlocked ?? false,
+              isPendingScan: selectedModerationInfo.isPendingScan ?? false,
+              isMalwareBlocked: selectedModerationInfo.isMalwareBlocked ?? false,
               isSuspicious: result.moderationInfo.isSuspicious ?? false,
-              isHiddenByMod: result.moderationInfo.isHiddenByMod ?? false,
-              isRemoved: result.moderationInfo.isRemoved ?? false,
+              isHiddenByMod: selectedModerationInfo.isHiddenByMod ?? false,
+              isRemoved: selectedModerationInfo.isRemoved ?? false,
             }
           : null,
         security,
@@ -2348,30 +2354,19 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
       );
     }
 
-    let resolvedFrom: VerificationResolvedFrom = "latest";
-    let version: Doc<"skillVersions"> | null = skillResult.skill.latestVersionId
-      ? await ctx.runQuery(internal.skills.getVersionByIdInternal, {
-          versionId: skillResult.skill.latestVersionId,
-        })
-      : null;
-    if (versionParam) {
-      resolvedFrom = "version";
-      version = await ctx.runQuery(internal.skills.getVersionBySkillAndVersionInternal, {
-        skillId: skillResult.skill._id,
-        version: versionParam,
-      });
-    } else if (tagParam) {
-      resolvedFrom = "tag";
-      const versionId = skillResult.skill.tags[tagParam];
-      version = versionId
-        ? await ctx.runQuery(internal.skills.getVersionByIdInternal, { versionId })
-        : null;
-    }
-
-    if (!version || !isSkillVersionForSkill(version, skillResult.skill._id)) {
-      return text("Version not found", 404, rate.headers);
-    }
-    if (version.softDeletedAt) return text("Version not available", 410, rate.headers);
+    const resolvedFrom: VerificationResolvedFrom = versionParam
+      ? "version"
+      : tagParam
+        ? "tag"
+        : "latest";
+    const selection = await readPublicSkillVersionSelection(
+      ctx,
+      skillResult.skill._id,
+      versionParam ? { version: versionParam } : tagParam ? { tag: tagParam } : {},
+    );
+    if (selection.status !== "available")
+      return unavailableSkillVersionResponse(selection, rate.headers);
+    const { version } = selection;
 
     const fingerprintEntries = ((await ctx.runQuery(
       internal.skills.listVersionFingerprintsInternal,
@@ -2380,7 +2375,8 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
     const bundleFingerprints = fingerprintEntries
       .filter((entry) => entry.kind === "generated-bundle")
       .map((entry) => entry.fingerprint);
-    const isMalwareBlocked = skillResult.moderationInfo?.isMalwareBlocked ?? false;
+    const isMalwareBlocked =
+      getSkillFileModerationInfoFromSkill(selection.skill).isMalwareBlocked ?? false;
     const generatedCardFile = isMalwareBlocked
       ? null
       : await selectGeneratedSkillCardFile(version.files, bundleFingerprints);
@@ -2491,33 +2487,18 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
       );
     }
 
-    let version: Doc<"skillVersions"> | null = skillResult.skill.latestVersionId
-      ? await ctx.runQuery(internal.skills.getVersionByIdInternal, {
-          versionId: skillResult.skill.latestVersionId,
-        })
-      : null;
-    if (versionParam) {
-      version = await ctx.runQuery(internal.skills.getVersionBySkillAndVersionInternal, {
-        skillId: skillResult.skill._id,
-        version: versionParam,
-      });
-    } else if (tagParam) {
-      const versionId = skillResult.skill.tags[tagParam];
-      version = versionId
-        ? await ctx.runQuery(internal.skills.getVersionByIdInternal, { versionId })
-        : null;
-    }
-
-    if (!version || !isSkillVersionForSkill(version, skillResult.skill._id)) {
-      return text("Version not found", 404, rate.headers);
-    }
-    if (version.softDeletedAt) return text("Version not available", 410, rate.headers);
-    const effectiveLatestVersionId =
-      skillResult.skill.latestVersionId ?? skillResult.skill.tags?.latest;
+    const selection = await readPublicSkillVersionSelection(
+      ctx,
+      skillResult.skill._id,
+      versionParam ? { version: versionParam } : tagParam ? { tag: tagParam } : {},
+    );
+    if (selection.status !== "available")
+      return unavailableSkillVersionResponse(selection, rate.headers);
+    const { version, skill: selectedSkill } = selection;
     const versionDownloadBlock = getPublicSkillVersionDownloadBlock(
-      skillResult.moderationInfo,
+      getSkillFileModerationInfoFromSkill(selectedSkill),
       version,
-      effectiveLatestVersionId,
+      selectedSkill.latestVersionId ?? selectedSkill.tags?.latest,
     );
     if (versionDownloadBlock) {
       return text(versionDownloadBlock.message, versionDownloadBlock.status, rate.headers);
@@ -2566,38 +2547,18 @@ export async function skillsGetRouterV1Handler(ctx: ActionCtx, request: Request)
         rate.headers,
       );
     }
-    const moderationBlock = getPublicSkillFileAccessBlock(skillResult.moderationInfo);
-    if (moderationBlock) {
-      return text(moderationBlock.message, moderationBlock.status, rate.headers);
-    }
-
-    let version: Doc<"skillVersions"> | null = skillResult.skill.latestVersionId
-      ? await ctx.runQuery(internal.skills.getVersionByIdInternal, {
-          versionId: skillResult.skill.latestVersionId,
-        })
-      : null;
-    if (versionParam) {
-      version = await ctx.runQuery(internal.skills.getVersionBySkillAndVersionInternal, {
-        skillId: skillResult.skill._id,
-        version: versionParam,
-      });
-    } else if (tagParam) {
-      const versionId = skillResult.skill.tags[tagParam];
-      if (versionId) {
-        version = await ctx.runQuery(internal.skills.getVersionByIdInternal, { versionId });
-      }
-    }
-
-    if (!version || !isSkillVersionForSkill(version, skillResult.skill._id)) {
-      return text("Version not found", 404, rate.headers);
-    }
-    if (version.softDeletedAt) return text("Version not available", 410, rate.headers);
-    const effectiveLatestVersionId =
-      skillResult.skill.latestVersionId ?? skillResult.skill.tags?.latest;
+    const selection = await readPublicSkillVersionSelection(
+      ctx,
+      skillResult.skill._id,
+      versionParam ? { version: versionParam } : tagParam ? { tag: tagParam } : {},
+    );
+    if (selection.status !== "available")
+      return unavailableSkillVersionResponse(selection, rate.headers);
+    const { version, skill: selectedSkill } = selection;
     const versionDownloadBlock = getPublicSkillVersionDownloadBlock(
-      skillResult.moderationInfo,
+      getSkillFileModerationInfoFromSkill(selectedSkill),
       version,
-      effectiveLatestVersionId,
+      selectedSkill.latestVersionId ?? selectedSkill.tags?.latest,
     );
     if (versionDownloadBlock) {
       return text(versionDownloadBlock.message, versionDownloadBlock.status, rate.headers);
@@ -2671,11 +2632,20 @@ export async function publishSkillV1Handler(ctx: ActionCtx, request: Request) {
 
     if (contentType.includes("multipart/form-data")) {
       const payload = await parseMultipartPublish(ctx, request);
-      if (!hasAcceptedLegacyLicenseTerms(payload.acceptLicenseTerms)) {
-        return text("MIT-0 license terms must be accepted to publish skills", 400, rate.headers);
+      let keepStoredFiles = false;
+      try {
+        if (!hasAcceptedLegacyLicenseTerms(payload.acceptLicenseTerms)) {
+          return text("MIT-0 license terms must be accepted to publish skills", 400, rate.headers);
+        }
+        const result = await publishSkillPayloadForApiUser(ctx, auth.userId, payload, () => {
+          keepStoredFiles = true;
+        });
+        return json({ ok: true, ...result }, 200, rate.headers);
+      } finally {
+        if (!keepStoredFiles) {
+          await deleteStoredMultipartFiles(ctx, payload.files);
+        }
       }
-      const result = await publishSkillPayloadForApiUser(ctx, auth.userId, payload);
-      return json({ ok: true, ...result }, 200, rate.headers);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : "Publish failed";
@@ -2689,6 +2659,7 @@ async function publishSkillPayloadForApiUser(
   ctx: ActionCtx,
   userId: Id<"users">,
   payload: ReturnType<typeof parsePublishBody>,
+  onFilesPersisted?: () => void,
 ) {
   const { ownerHandle, sourceOwnerHandle, migrateOwner, ...publishPayload } = payload;
   const uploadTickets = publishPayload.files.flatMap((file) =>
@@ -2723,6 +2694,7 @@ async function publishSkillPayloadForApiUser(
       ...(source ? { sourceOwnerPublisherId: source.publisherId } : {}),
       ...(shouldMigrateOwner ? { migrateOwner: true } : {}),
       ...(uploadTickets.length > 0 ? { skillPublishUploadTickets: uploadTickets } : {}),
+      ...(onFilesPersisted ? { onFilesPersisted } : {}),
     },
   );
 }
@@ -3907,12 +3879,20 @@ export async function exportSkillsV1Handler(
 
   try {
     logContext.phase = "load_versions";
-    const versionDocs = await chunkedParallel(result.page, 100, (digest) =>
-      digest.latestVersionId
-        ? ctx.runQuery(internal.skills.getVersionByIdInternal, {
-            versionId: digest.latestVersionId,
-          })
-        : Promise.resolve(null),
+    const versionTargets = result.page.filter((digest) => digest.latestVersionId);
+    const versionSelections = await readPublicSkillVersionSelections(
+      ctx,
+      versionTargets.map((digest) => ({
+        skillId: digest.skillId,
+        versionId: digest.latestVersionId!,
+      })),
+    );
+    let selectionIndex = 0;
+    const selectedVersions = result.page.map((digest) =>
+      digest.latestVersionId ? versionSelections[selectionIndex++] : null,
+    );
+    const versionDocs = selectedVersions.map((selection) =>
+      selection?.status === "available" ? selection.version : null,
     );
     const githubTargets = await chunkedParallel(result.page, 100, (digest) =>
       isGitHubSourceExportDigest(digest)
@@ -3944,7 +3924,7 @@ export async function exportSkillsV1Handler(
     logContext.phase = "plan_blobs";
     for (let i = 0; i < result.page.length; i++) {
       const digest = result.page[i];
-      const version = versionDocs[i] as Doc<"skillVersions"> | null;
+      const version = versionDocs[i];
 
       if (!version) {
         if (isGitHubSourceExportDigest(digest)) {
@@ -3969,28 +3949,28 @@ export async function exportSkillsV1Handler(
         }
         exportErrors.push({
           slug: digest.slug,
-          error: `version not found (latestVersionId: ${digest.latestVersionId ?? "null"})`,
+          error:
+            selectedVersions[i]?.status === "deleted"
+              ? "version not available"
+              : "version not found",
         });
         continue;
       }
-      if (!isSkillVersionForSkill(version, digest.skillId)) {
-        exportErrors.push({
-          slug: digest.slug,
-          error: `version not found (latestVersionId: ${digest.latestVersionId})`,
-        });
-        continue;
-      }
-      if (version.softDeletedAt) {
-        exportErrors.push({
-          slug: digest.slug,
-          error: `version not available (latestVersionId: ${digest.latestVersionId})`,
-        });
+      const selection = selectedVersions[i];
+      if (selection?.status !== "available") continue;
+      const versionBlock = getPublicSkillVersionDownloadBlock(
+        getSkillFileModerationInfoFromSkill(selection.skill),
+        version,
+        selection.skill.latestVersionId ?? selection.skill.tags?.latest,
+      );
+      if (versionBlock) {
+        exportErrors.push({ slug: digest.slug, error: versionBlock.message });
         continue;
       }
       if (!version.files || version.files.length === 0) {
         exportErrors.push({
           slug: digest.slug,
-          error: `version has no files (latestVersionId: ${digest.latestVersionId})`,
+          error: "version has no files",
         });
         continue;
       }

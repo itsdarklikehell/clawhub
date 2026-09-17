@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { classifyPluginCategories } from "./pluginCategoryClassification";
+import {
+  classifyPluginCategories,
+  readPluginCategoryDocumentation,
+} from "./pluginCategoryClassification";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -31,32 +34,38 @@ function modelResponse(categories: string[]) {
 }
 
 describe("single-purpose plugin classification", () => {
-  it("requires one category for new author declarations without consulting a model", async () => {
-    const request = modelResponse(["scheduling"]);
-    await expect(
-      classifyPluginCategories({
-        name: "appointments",
-        pluginManifest: { categories: ["productivity", "scheduling"] },
-      }),
-    ).rejects.toThrow("exactly one category");
-    expect(request).not.toHaveBeenCalled();
-  });
+  it.each([{ categories: ["productivity", "scheduling"] }, { categories: ["runtime"] }])(
+    "requires one active category for new author declarations without consulting a model: $categories",
+    async ({ categories }) => {
+      const request = modelResponse(["scheduling"]);
+      await expect(
+        classifyPluginCategories({
+          name: "appointments",
+          pluginManifest: { categories },
+        }),
+      ).rejects.toThrow("exactly one category");
+      expect(request).not.toHaveBeenCalled();
+    },
+  );
 
-  it("preserves an existing multi-category declaration when refreshing a published release", async () => {
-    const request = modelResponse(["scheduling"]);
-    const result = await classifyPluginCategories(
-      {
-        name: "appointments",
-        pluginManifest: { categories: ["productivity", "scheduling"] },
-      },
-      { allowLegacyDeclarations: true },
-    );
-    expect(result).toMatchObject({
-      categories: ["productivity", "scheduling"],
-      classification: { source: "manifest" },
-    });
-    expect(request).not.toHaveBeenCalled();
-  });
+  it.each([["tools", "web", "channels"], ["runtime"]])(
+    "reassesses legacy categories %s by primary purpose when refreshing",
+    async (...categories) => {
+      const request = modelResponse(["scheduling"]);
+      const result = await classifyPluginCategories(
+        {
+          name: "appointments",
+          pluginManifest: { categories, description: "Manage appointments and availability." },
+        },
+        { allowLegacyDeclarations: true },
+      );
+      expect(result).toMatchObject({
+        categories: ["scheduling"],
+        classification: { source: "generated" },
+      });
+      expect(request).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("uses Luna independently of the skill-summary model and constrains its output to one category", async () => {
     const request = modelResponse(["scheduling"]);
@@ -96,7 +105,7 @@ describe("single-purpose plugin classification", () => {
     expect(body.instructions).toContain("agent-runtimes: Agent execution engines");
     expect(result).toMatchObject({
       categories: ["agent-runtimes"],
-      classification: { source: "generated", classifierVersion: "plugin-single-category-v3" },
+      classification: { source: "generated", classifierVersion: "plugin-single-category-v6" },
     });
   });
 
@@ -123,4 +132,67 @@ describe("single-purpose plugin classification", () => {
       });
     },
   );
+});
+
+describe("plugin classification documentation", () => {
+  it.each(["plugin", "bundle"])(
+    "preserves %s-declared skill evidence within the shared file and character budgets",
+    async (declaration) => {
+      const contents = new Map([
+        ["README.md", "Package overview. ".repeat(1_500)],
+        ["skills/appointments/SKILL.md", "Review calendar appointments and booking availability."],
+        ...Array.from({ length: 9 }, (_, index): [string, string] => [
+          `a${index}/README.md`,
+          "Secondary documentation.",
+        ]),
+      ]);
+      const files = [...contents].map(([path, text]) => ({
+        path,
+        size: new TextEncoder().encode(text).byteLength,
+        storageId: path,
+        sha256: "published-doc",
+      }));
+      files.push(
+        { path: "README.mdx", size: 512_001, storageId: "oversized", sha256: "oversized" },
+        { path: "index.js", size: 10, storageId: "runtime", sha256: "runtime" },
+      );
+      const get = vi.fn(async (id: string) => {
+        const text = contents.get(id);
+        if (text === undefined) throw new Error("Read outside bounded documentation");
+        return new Blob([text]);
+      });
+      const input = {
+        files,
+        pluginManifest:
+          declaration === "plugin" ? { skills: ["./skills"] } : { id: "appointments" },
+        bundleManifest:
+          declaration === "bundle" ? { bundledSkills: ["./skills"] } : { name: "Appointments" },
+      };
+      const documentation = await readPluginCategoryDocumentation(
+        { storage: { get } } as never,
+        input,
+      );
+      expect(documentation).toContain("Package overview.");
+      expect(documentation).toContain("[skills/appointments/SKILL.md]");
+      expect(documentation).toContain("Review calendar appointments and booking availability.");
+      expect(documentation.length).toBeLessThanOrEqual(16_000);
+      expect(get).toHaveBeenCalledTimes(8);
+      const reversedFiles = [...files];
+      reversedFiles.reverse();
+      await expect(
+        readPluginCategoryDocumentation({ storage: { get } } as never, {
+          ...input,
+          files: reversedFiles,
+        }),
+      ).resolves.toBe(documentation);
+    },
+  );
+
+  it("reports a missing selected document instead of classifying incomplete artifact evidence", async () => {
+    await expect(
+      readPluginCategoryDocumentation({ storage: { get: async () => null } } as never, {
+        files: [{ path: "README.md", size: 50, storageId: "missing", sha256: "published-doc" }],
+      }),
+    ).rejects.toThrow("README.md");
+  });
 });

@@ -12,7 +12,12 @@ The **Plugin Category Refresh** GitHub workflow operates on production
 `wry-manatee-359` using the existing Production environment credential. It never
 deploys code. First deploy the matching frontend and backend from main through
 the normal release workflow. Every operation verifies the exact deployed commit
-and public category vocabulary before proceeding.
+and public category vocabulary before proceeding. Dispatch from main even if
+main has advanced: the workflow checks out `expected_sha` and verifies it is an
+ancestor of the main revision that received the dispatch before running any
+repository code. The operator independently verifies its actual Git checkout.
+This requires a deployed revision containing the resumable operator; an older
+operator cannot acquire this behavior just by changing the dispatch revision.
 
 Keep production deployments frozen for the whole refresh window. The SHA check
 is a preflight, not a global deployment lock. Apply starts an asynchronous
@@ -52,8 +57,19 @@ Run `mode=report` with `cursor`/`max_pages` to export up to 2,000 journal rows p
 dispatch. Report cursors and preview cursors belong to different tables; do not
 interchange them. Inspect proposed categories, source, evidence, previous
 categories, version, and status. Fallback rows cannot be accepted; retry failed
-classifications under a new run ID. Existing author declarations, including
-valid legacy arrays, remain authoritative.
+classifications under a new run ID. A current single-category author declaration
+remains authoritative. Legacy capability arrays and retired categories are
+reassessed from the plugin's main purpose.
+
+Publication and refresh share bounded manifest, README/MDX, and bundled-skill
+evidence. Declared skills take priority over secondary documentation; a long
+README cannot consume the whole document budget. A plugin that enhances an
+existing channel or adapts tools for an existing model is categorized by that
+workflow, rather than by the transport or model it uses. Reusable configurable
+API/MCP clients have Integrations as their own purpose. Category examples are
+illustrative: a known workflow can fit a broad category without an exact specialty
+label. Other requires an unsupported purpose or insufficient evidence; inspect
+that explanation before accepting.
 
 Choose at most 100 rows for a wave, starting with a small pilot. Use `report`
 with the JSON `reviewed_ids` array to get the exact selected rows and their
@@ -74,7 +90,7 @@ gh workflow run plugin-category-refresh.yml --repo openclaw/clawhub --ref main \
 Accept marks reviewed rows accepted and rehearses the first ten through a
 transaction that rolls back. Category state stays unchanged. A failed rehearsal
 leaves accepted rows available for inspection. Fresh generated previews must use
-classifier `plugin-single-category-v3`; bundled previews must match the pinned
+classifier `plugin-single-category-v6`; bundled previews must match the pinned
 OpenClaw source commit and manifest hashes in the checked-out inventory.
 
 ## Apply, monitor, and undo

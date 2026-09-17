@@ -129,7 +129,8 @@ See [CLI login](./auth.md#cli-login) for the approval steps and expiry guidance.
   - `--limit <n>` (1-200, default: 25)
   - `--sort newest|updated|rating|downloads|trending` (default: newest). Legacy install sort aliases still work for compatibility.
   - `--json` (machine-readable output)
-- Output: `<slug>  v<version>  <age>  <summary>` (summary truncated to 50 chars).
+- Output: `<ownerHandle>/<slug>  v<version>  <age>  <summary>` (summary truncated to 50 chars).
+- Older custom registries selected with `--registry` may omit owner or latest-version fields. The CLI preserves their slug-only output and displays `v?` for an omitted version; explicit `latestVersion: null` is also accepted.
 
 ### `inspect @owner/slug`
 

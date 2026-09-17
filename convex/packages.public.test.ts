@@ -2,6 +2,7 @@
 
 import { getAuthUserId } from "@convex-dev/auth/server";
 import { type FunctionReference, getFunctionName } from "convex/server";
+import { convexToJson, jsonToConvex, type Value } from "convex/values";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { sha256Hex } from "./lib/clawpack";
 import { verifyOpenClawPublishAuthorization } from "./lib/openClawPublishAuthorization";
@@ -79,6 +80,7 @@ import {
   searchForViewerInternal,
   searchPublic,
 } from "./packages";
+import { preview as previewPluginCategoryRefresh } from "./pluginCategoryRefresh";
 import { runStaticPublishScanInternal } from "./staticPublishScanNode";
 
 vi.mock("@convex-dev/auth/server", () => ({
@@ -461,6 +463,7 @@ const publishPackageForUserInternalHandler = (
     {
       actorUserId: string;
       payload: unknown;
+      requestStorageIds?: string[];
     },
     unknown
   >
@@ -473,6 +476,7 @@ const publishPackageForTrustedPublisherInternalHandler = (
     {
       publishTokenId: string;
       payload: unknown;
+      requestStorageIds?: string[];
     },
     unknown
   >
@@ -1622,11 +1626,16 @@ function makeDigestCtx(options: {
           return null;
         }),
         query: vi.fn((table: string) => {
+          if (table === "featuredSelections")
+            return { withIndex: vi.fn(() => ({ unique: vi.fn().mockResolvedValue(null) })) };
           if (table === "packageBadges") {
             return {
               withIndex: vi.fn(() => ({
                 order: vi.fn(() => ({
                   take: vi.fn().mockResolvedValue(options.highlightedBadges ?? []),
+                  async *[Symbol.asyncIterator]() {
+                    yield* options.highlightedBadges ?? [];
+                  },
                 })),
               })),
             };
@@ -7611,9 +7620,6 @@ describe("packages public queries", () => {
         updatedAt: expect.any(Number),
       }),
     );
-    const digestPatch = patch.mock.calls.find(([id]) => id === "packageSearchDigest:demo")?.[1];
-    expect(digestPatch).not.toHaveProperty("softDeletedBy");
-    expect(digestPatch).not.toHaveProperty("softDeletedByRole");
     expect(insert).toHaveBeenCalledWith(
       "auditLogs",
       expect.objectContaining({
@@ -7773,9 +7779,6 @@ describe("packages public queries", () => {
         updatedAt: expect.any(Number),
       }),
     );
-    const digestPatch = patch.mock.calls.find(([id]) => id === "packageSearchDigest:demo")?.[1];
-    expect(digestPatch).not.toHaveProperty("softDeletedBy");
-    expect(digestPatch).not.toHaveProperty("softDeletedByRole");
     expect(insert).toHaveBeenCalledWith(
       "auditLogs",
       expect.objectContaining({
@@ -9075,6 +9078,30 @@ describe("packages public queries", () => {
 
     expect(ctx.patch).not.toHaveBeenCalledWith("packageReleases:old", expect.anything());
     expect(ctx.scheduler.runAfter).not.toHaveBeenCalled();
+  });
+
+  it("keeps the strict finalization result free of release ownership metadata", async () => {
+    const result = { ok: true, packageId: "packages:demo", releaseId: "packageReleases:existing" };
+    const runMutation = vi.fn(async (ref: unknown, args: unknown) => {
+      const name = getFunctionName(ref as FunctionReference<"mutation">);
+      if (name.endsWith("claimPackagePublishAttemptForFinalizationInternal"))
+        return {
+          status: "claimed",
+          attemptId: "publishAttempts:legacy",
+          packageInsertArgs: {},
+          packageFollowup: {},
+        };
+      if (name.endsWith("insertReleaseInternal")) return { ...result, reusedExistingRelease: true };
+      if (name.endsWith("recordPackagePublishAttemptFinalizedInternal"))
+        expect((args as { result: unknown }).result).toEqual(result);
+      return null;
+    });
+    await expect(
+      finalizePackagePublishAttemptInternalHandler(
+        { runMutation, scheduler: { runAfter: vi.fn() } } as never,
+        { attemptId: "publishAttempts:legacy" },
+      ),
+    ).resolves.toEqual(result);
   });
 
   it("releases release-backed finalization claims when pending promotion fails", async () => {
@@ -10827,6 +10854,41 @@ describe("packages public queries", () => {
     expect(ctx.patch).not.toHaveBeenCalled();
   });
 
+  it.each(["published", "pending"] as const)(
+    "rejects a pending insertion racing an existing %s release",
+    async (publicationStatus) => {
+      const ctx = makeInsertReleaseCtx(makePackageDoc(), [
+        makeReleaseDoc({
+          _id: "packageReleases:existing",
+          version: "1.0.0",
+          integritySha256: "abc123",
+          publicationStatus,
+          clawpackStorageId: "storage:existing-zip",
+        }),
+      ]);
+      await expect(
+        insertReleaseInternalHandler(ctx, {
+          actorUserId: "users:owner",
+          ownerUserId: "users:owner",
+          name: "demo-plugin",
+          displayName: "Demo Plugin",
+          family: "code-plugin",
+          version: "1.0.0",
+          changelog: "retry",
+          tags: ["latest"],
+          summary: "demo",
+          files: [],
+          integritySha256: "abc123",
+          allowExistingRelease: true,
+          publicationStatus: "pending",
+          clawpackStorageId: "storage:new-zip",
+        }),
+      ).rejects.toThrow("already exists");
+      expect(ctx.insert).not.toHaveBeenCalled();
+      expect(ctx.patch).not.toHaveBeenCalled();
+    },
+  );
+
   it("rejects a Claw version retry when the exact artifact digest differs", async () => {
     const ctx = makeInsertReleaseCtx(makePackageDoc({ family: "claw" }), [
       makeReleaseDoc({
@@ -10976,6 +11038,36 @@ describe("packages public queries", () => {
         tags: { beta: "packageReleases:new" },
       }),
     );
+  });
+
+  it("reclaims only request-created blobs when package validation rejects before adoption", async () => {
+    const remove = vi.fn().mockResolvedValue(undefined);
+    await expect(
+      publishPackageForUserInternalHandler({ storage: { delete: remove } } as never, {
+        actorUserId: "users:owner",
+        requestStorageIds: ["storage:request-file"],
+        payload: { invalid: true, artifact: { storageId: "storage:reused-tarball" } },
+      }),
+    ).rejects.toThrow(/Package publish payload/i);
+    expect(remove).toHaveBeenCalledExactlyOnceWith("storage:request-file");
+  });
+
+  it("reclaims request files when trusted authorization expires before publication", async () => {
+    const remove = vi.fn().mockResolvedValue(undefined);
+    await expect(
+      publishPackageForTrustedPublisherInternalHandler(
+        {
+          runQuery: vi.fn().mockResolvedValue(null),
+          storage: { delete: remove },
+        } as never,
+        {
+          publishTokenId: "packagePublishTokens:expired",
+          requestStorageIds: ["storage:request-file"],
+          payload: { artifact: { storageId: "storage:reused-tarball" } },
+        },
+      ),
+    ).rejects.toThrow("Trusted publish token is missing or expired");
+    expect(remove).toHaveBeenCalledExactlyOnceWith("storage:request-file");
   });
 
   it("validates package publish payloads inside the action path", async () => {
@@ -11985,7 +12077,7 @@ describe("packages public queries", () => {
     );
   });
 
-  it("revokes trusted publish tokens after a successful publish", async () => {
+  it("accepts and records tag refs for ordinary trusted publishes", async () => {
     const runMutation = vi.fn(async (_ref: unknown, args: unknown) => {
       if (
         typeof args === "object" &&
@@ -12028,7 +12120,7 @@ describe("packages public queries", () => {
           environment: "clawhub-release",
           version: "1.0.0",
           sha: "abc123",
-          ref: "refs/heads/main",
+          ref: "refs/tags/v1.0.0",
           runId: "100",
           runAttempt: "1",
           expiresAt: Date.now() + 60_000,
@@ -12055,6 +12147,15 @@ describe("packages public queries", () => {
           version: "1.0.0",
           changelog: "init",
           bundle: { hostTargets: ["desktop"] },
+          source: {
+            kind: "github",
+            url: "https://github.com/example/example",
+            repo: "example/example",
+            ref: "refs/tags/v1.0.0",
+            commit: "abc123",
+            path: ".",
+            importedAt: 1,
+          },
           files: [packageManifestFile],
         },
       }),
@@ -12067,7 +12168,114 @@ describe("packages public queries", () => {
     expect(runMutation).toHaveBeenCalledWith(expect.anything(), {
       tokenId: "packagePublishTokens:1",
     });
+    expect(runMutation).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        source: expect.objectContaining({
+          repo: "example/example",
+          ref: "refs/tags/v1.0.0",
+          commit: "abc123",
+          path: ".",
+        }),
+      }),
+    );
   });
+
+  it.each([
+    {
+      mode: "ordinary commit",
+      candidateSha: undefined,
+      sourceCommit: "wrong-sha",
+      sourceRef: "refs/tags/v1.0.0",
+      expectedError: "Trusted publish source commit must match the authorized source commit",
+    },
+    {
+      mode: "ordinary ref",
+      candidateSha: undefined,
+      sourceCommit: "abc123",
+      sourceRef: "refs/tags/v2.0.0",
+      expectedError: "Trusted publish source ref must match the authorized source ref",
+    },
+    {
+      mode: "split-candidate commit",
+      candidateSha: "candidate-sha",
+      sourceCommit: "abc123",
+      sourceRef: "candidate-sha",
+      expectedError: "Trusted publish source commit must match the authorized source commit",
+    },
+    {
+      mode: "split-candidate ref",
+      candidateSha: "candidate-sha",
+      sourceCommit: "candidate-sha",
+      sourceRef: "refs/tags/v1.0.0",
+      expectedError: "Trusted publish source ref must match the authorized source ref",
+    },
+  ])(
+    "rejects $mode mismatches",
+    async ({ candidateSha, sourceCommit, sourceRef, expectedError }) => {
+      const trustedPublisher = {
+        _id: "packageTrustedPublishers:1",
+        packageId: "packages:demo",
+        provider: "github-actions",
+        repository: "example/example",
+        repositoryId: "1",
+        repositoryOwner: "example",
+        repositoryOwnerId: "2",
+        workflowFilename: "plugin-clawhub-release.yml",
+        environment: "clawhub-release",
+      };
+      const ctx = {
+        runQuery: vi
+          .fn()
+          .mockResolvedValueOnce({
+            _id: "packagePublishTokens:1",
+            packageId: "packages:demo",
+            provider: "github-actions",
+            repository: "example/example",
+            repositoryId: "1",
+            repositoryOwner: "example",
+            repositoryOwnerId: "2",
+            workflowFilename: "plugin-clawhub-release.yml",
+            environment: "clawhub-release",
+            version: "1.0.0",
+            sha: "abc123",
+            ref: "refs/tags/v1.0.0",
+            runId: "100",
+            runAttempt: "1",
+            candidateSha,
+            expiresAt: Date.now() + 60_000,
+          })
+          .mockResolvedValueOnce(trustedPublisher)
+          .mockResolvedValueOnce(makePackageDoc({ family: "bundle-plugin" }))
+          .mockResolvedValueOnce(trustedPublisher),
+      };
+
+      await expect(
+        publishPackageForTrustedPublisherInternalHandler(ctx as never, {
+          publishTokenId: "packagePublishTokens:1",
+          payload: {
+            name: "demo-plugin",
+            family: "bundle-plugin",
+            version: "1.0.0",
+            changelog: "init",
+            bundle: { hostTargets: ["desktop"] },
+            source: {
+              kind: "github",
+              url: "https://github.com/example/example",
+              repo: "example/example",
+              ref: sourceRef,
+              commit: sourceCommit,
+              path: ".",
+              importedAt: 1,
+            },
+            files: [packageManifestFile],
+          },
+        }),
+      ).rejects.toThrow(expectedError);
+
+      expect(ctx.runQuery).toHaveBeenCalledTimes(4);
+    },
+  );
 
   it("revokes trusted publish tokens when a staged publish is accepted for checks", async () => {
     const previousFlag = process.env.CLAWHUB_STAGED_PREPUBLICATION_PUBLISHES;
@@ -12378,13 +12586,14 @@ describe("packages public queries", () => {
       scheduler: {
         runAfter: vi.fn(),
       },
-      storage: makePackageManifestStorage(),
+      storage: { ...makePackageManifestStorage(), delete: vi.fn() },
     };
 
     try {
       await expect(
         publishPackageForTrustedPublisherInternalHandler(ctx as never, {
           publishTokenId: "packagePublishTokens:1",
+          requestStorageIds: [packageManifestFile.storageId],
           payload: {
             name: "demo-plugin",
             family: "bundle-plugin",
@@ -12411,6 +12620,7 @@ describe("packages public queries", () => {
         createdNewParent: false,
       }),
     );
+    expect(ctx.storage.delete).not.toHaveBeenCalled();
     expect(runMutation).not.toHaveBeenCalledWith(expect.anything(), {
       tokenId: "packagePublishTokens:1",
     });
@@ -12575,6 +12785,215 @@ describe("packages public queries", () => {
 
     expect(runMutation).not.toHaveBeenCalled();
   });
+
+  it("does not leave a legacy zip blob when staged publish rejects a duplicate version", async () => {
+    const previousFlag = process.env.CLAWHUB_STAGED_PREPUBLICATION_PUBLISHES;
+    process.env.CLAWHUB_STAGED_PREPUBLICATION_PUBLISHES = "1";
+    const storedIds: string[] = [];
+    const deletedIds: string[] = [];
+    const runMutation = vi.fn(async () => {
+      throw new Error("duplicate publish should not create an attempt");
+    });
+    const trustedPublisher = {
+      _id: "packageTrustedPublishers:1",
+      packageId: "packages:demo",
+      provider: "github-actions",
+      repository: "example/example",
+      repositoryId: "1",
+      repositoryOwner: "example",
+      repositoryOwnerId: "2",
+      workflowFilename: "plugin-clawhub-release.yml",
+      environment: "clawhub-release",
+    };
+    const ctx = {
+      runQuery: vi
+        .fn()
+        .mockResolvedValueOnce({
+          _id: "packagePublishTokens:1",
+          packageId: "packages:demo",
+          provider: "github-actions",
+          repository: "example/example",
+          repositoryId: "1",
+          repositoryOwner: "example",
+          repositoryOwnerId: "2",
+          workflowFilename: "plugin-clawhub-release.yml",
+          environment: "clawhub-release",
+          version: "1.0.0",
+          sha: "abc123",
+          ref: "refs/heads/main",
+          runId: "100",
+          runAttempt: "1",
+          expiresAt: Date.now() + 60_000,
+        })
+        .mockResolvedValueOnce(trustedPublisher)
+        .mockResolvedValueOnce(makePackageDoc({ family: "bundle-plugin" }))
+        .mockResolvedValueOnce(trustedPublisher)
+        .mockResolvedValueOnce(null)
+        .mockResolvedValueOnce({
+          attemptId: "publishAttempts:secret-blocked",
+          status: "blocked",
+        }),
+      runMutation,
+      runAction: makePublishRunActionMock(),
+      scheduler: {
+        runAfter: vi.fn(),
+      },
+      storage: {
+        ...makePackageManifestStorage(),
+        store: vi.fn(async () => {
+          storedIds.push("storage:legacy-zip");
+          return "storage:legacy-zip";
+        }),
+        delete: vi.fn(async (storageId: string) => {
+          deletedIds.push(storageId);
+        }),
+      },
+    };
+
+    try {
+      await expect(
+        publishPackageForTrustedPublisherInternalHandler(ctx as never, {
+          publishTokenId: "packagePublishTokens:1",
+          payload: {
+            name: "demo-plugin",
+            family: "bundle-plugin",
+            version: "1.0.0",
+            changelog: "duplicate",
+            bundle: { hostTargets: ["desktop"] },
+            files: [packageManifestFile],
+          },
+        }),
+      ).rejects.toThrow(
+        "Version 1.0.0 already exists. Increment the version number and try again.",
+      );
+    } finally {
+      if (previousFlag === undefined) {
+        delete process.env.CLAWHUB_STAGED_PREPUBLICATION_PUBLISHES;
+      } else {
+        process.env.CLAWHUB_STAGED_PREPUBLICATION_PUBLISHES = previousFlag;
+      }
+    }
+
+    expect(runMutation).not.toHaveBeenCalled();
+    expect(storedIds.filter((storageId) => !deletedIds.includes(storageId))).toEqual([]);
+  });
+
+  it.each(["rejected", "reused", "created", "followup-failure"] as const)(
+    "keeps generated ZIP and request-file ownership after %s insertion",
+    async (outcome) => {
+      const storedIds: string[] = [];
+      const deletedIds: string[] = [];
+      const runMutation = vi.fn(async (_ref: unknown, args: unknown) => {
+        if (
+          typeof args === "object" &&
+          args !== null &&
+          "name" in args &&
+          "version" in args &&
+          "files" in args
+        ) {
+          if (outcome === "rejected") throw new Error("release insert rejected");
+          return {
+            ok: true,
+            packageId: "packages:demo",
+            releaseId: "packageReleases:result",
+            ...(outcome === "reused" ? { reusedExistingRelease: true } : {}),
+          };
+        }
+        if (
+          outcome === "followup-failure" &&
+          typeof args === "object" &&
+          args !== null &&
+          "source" in args &&
+          args.source === "publish"
+        )
+          throw new Error("post-insert followup failed");
+        return null;
+      });
+      const trustedPublisher = {
+        _id: "packageTrustedPublishers:1",
+        packageId: "packages:demo",
+        provider: "github-actions",
+        repository: "example/example",
+        repositoryId: "1",
+        repositoryOwner: "example",
+        repositoryOwnerId: "2",
+        workflowFilename: "plugin-clawhub-release.yml",
+        environment: "clawhub-release",
+      };
+      const ctx = {
+        runQuery: vi
+          .fn()
+          .mockResolvedValueOnce({
+            _id: "packagePublishTokens:1",
+            packageId: "packages:demo",
+            provider: "github-actions",
+            repository: "example/example",
+            repositoryId: "1",
+            repositoryOwner: "example",
+            repositoryOwnerId: "2",
+            workflowFilename: "plugin-clawhub-release.yml",
+            environment: "clawhub-release",
+            version: "1.0.0",
+            sha: "abc123",
+            ref: "refs/heads/main",
+            runId: "100",
+            runAttempt: "1",
+            expiresAt: Date.now() + 60_000,
+          })
+          .mockResolvedValueOnce(trustedPublisher)
+          .mockResolvedValueOnce(makePackageDoc({ family: "bundle-plugin" }))
+          .mockResolvedValueOnce(trustedPublisher)
+          .mockResolvedValueOnce(null),
+        runMutation,
+        runAction: makePublishRunActionMock(),
+        scheduler: {
+          runAfter: vi.fn(),
+        },
+        storage: {
+          ...makePackageManifestStorage(),
+          store: vi.fn(async () => {
+            storedIds.push("storage:legacy-zip");
+            return "storage:legacy-zip";
+          }),
+          delete: vi.fn(async (storageId: string) => {
+            deletedIds.push(storageId);
+          }),
+        },
+      };
+
+      const publication = publishPackageForTrustedPublisherInternalHandler(ctx as never, {
+        publishTokenId: "packagePublishTokens:1",
+        requestStorageIds: [packageManifestFile.storageId],
+        payload: {
+          name: "demo-plugin",
+          family: "bundle-plugin",
+          version: "1.0.0",
+          changelog: "duplicate",
+          bundle: { hostTargets: ["desktop"] },
+          files: [packageManifestFile],
+        },
+      });
+      if (outcome === "rejected" || outcome === "followup-failure") {
+        await expect(publication).rejects.toThrow(
+          outcome === "rejected" ? "release insert rejected" : "post-insert followup failed",
+        );
+      } else {
+        await expect(publication).resolves.toEqual({
+          ok: true,
+          packageId: "packages:demo",
+          releaseId: "packageReleases:result",
+          publicationStatus: "published",
+        });
+      }
+
+      expect(storedIds).toEqual(["storage:legacy-zip"]);
+      expect(deletedIds).toEqual(
+        outcome === "rejected" || outcome === "reused"
+          ? ["storage:legacy-zip", packageManifestFile.storageId]
+          : [],
+      );
+    },
+  );
 
   it("accepts trusted publish tokens when no environment is pinned", async () => {
     const runMutation = vi.fn(async (_ref: unknown, args: unknown) => {
@@ -12958,6 +13377,7 @@ describe("packages public queries", () => {
       bundleManifest?: Record<string, unknown>,
       declaredCategories?: string[],
       portableIcon?: Uint8Array,
+      documentation?: Array<{ path: string; text: string }>,
     ) {
       const runMutation = vi.fn(async (_ref: unknown, args: Record<string, unknown>) => {
         if ("sha256" in args && "contentType" in args) return args;
@@ -12991,9 +13411,13 @@ describe("packages public queries", () => {
             icon,
             categories: declaredCategories,
             description: "Manages appointments and availability.",
-            contracts: { tools: ["demoTool"] },
+            contracts: { webFetchProviders: ["fetch"], tools: ["demoTool"] },
+            ...(documentation ? { skills: ["./skills"] } : {}),
           }),
         ],
+        ...(documentation ?? []).map(
+          ({ path, text }) => [`storage:${path}`, text] as [string, string],
+        ),
         ...(bundleManifest
           ? ([["storage:bundle-manifest", JSON.stringify(bundleManifest)]] as Array<
               [string, string]
@@ -13095,6 +13519,13 @@ describe("packages public queries", () => {
               sha256: "code",
               contentType: "application/javascript",
             },
+            ...(documentation ?? []).map(({ path, text }) => ({
+              path,
+              size: new TextEncoder().encode(text).byteLength,
+              storageId: `storage:${path}`,
+              sha256: "documentation",
+              contentType: "text/markdown",
+            })),
             ...(portableIcon
               ? [
                   {
@@ -13117,7 +13548,47 @@ describe("packages public queries", () => {
           (args as { name?: string }).name === "demo-plugin" &&
           (args as { version?: string }).version === "1.0.0",
       );
-      return insertCall?.[1] as Record<string, unknown>;
+      const published = insertCall?.[1] as Record<string, unknown>;
+      if (documentation) {
+        const previewMutation = vi.fn(
+          async (
+            _ref: unknown,
+            _args: {
+              classification: { inputHash: string };
+            },
+          ) => "preview:same-release",
+        );
+        const previewHandler = (
+          previewPluginCategoryRefresh as unknown as WrappedHandler<
+            { runId: string },
+            { previewed: number; failed: number }
+          >
+        )._handler;
+        const result = await previewHandler(
+          {
+            storage: ctx.storage,
+            runQuery: vi.fn(async (_ref: unknown, args: Record<string, unknown>) =>
+              "batchSize" in args
+                ? { ids: ["packages:demo"], cursor: "done", isDone: true }
+                : {
+                    pkg: { name: "demo-plugin", family: published.family },
+                    release: jsonToConvex(
+                      convexToJson({ ...published, _id: "releases:demo-1" } as Value),
+                    ),
+                    beforeHash: "same-release",
+                  },
+            ),
+            runMutation: previewMutation,
+          },
+          { runId: "same-published-artifact" },
+        );
+        expect(result).toMatchObject({ previewed: 1, failed: 0 });
+        const preview = previewMutation.mock.calls[0][1];
+        expect
+          .soft(preview.classification.inputHash, documentation.map(({ path }) => path).join(", "))
+          .toBe((published.categoryClassification as { inputHash: string }).inputHash);
+      }
+      return published;
     }
 
     const portableIcon = new Uint8Array(
@@ -13157,9 +13628,47 @@ describe("packages public queries", () => {
       pluginManifestSummary: { categories: ["scheduling"] },
     });
 
+    for (const documentation of [
+      [
+        {
+          path: "skills/appointments/SKILL.md",
+          text: "Calendar appointments and booking availability.",
+        },
+      ],
+      [
+        { path: "README.md", text: "Packaging notes. ".repeat(1_500) },
+        {
+          path: "skills/appointments/SKILL.md",
+          text: "Calendar appointments and booking availability.",
+        },
+      ],
+      [{ path: "README.mdx", text: "Calendar appointments and booking availability." }],
+    ]) {
+      modelFetch.mockClear();
+      await publishWithManifestIcon(
+        undefined,
+        { name: "Appointments", skills: ["./skills"] },
+        undefined,
+        undefined,
+        documentation,
+      );
+      expect(modelFetch).toHaveBeenCalledTimes(2);
+      for (const [, request] of modelFetch.mock.calls as unknown as Array<[string, RequestInit]>) {
+        const input = JSON.parse(JSON.parse(request.body as string).input);
+        expect
+          .soft(input.documentation)
+          .toContain("Calendar appointments and booking availability.");
+      }
+    }
+
     modelFetch.mockClear();
     await expect(
-      publishWithManifestIcon(undefined, undefined, ["productivity"]),
+      publishWithManifestIcon(undefined, undefined, ["productivity"], undefined, [
+        {
+          path: "skills/appointments/SKILL.md",
+          text: "Calendar appointments and booking availability.",
+        },
+      ]),
     ).resolves.toMatchObject({
       categories: ["productivity"],
       categoryClassification: { source: "manifest" },
@@ -19064,7 +19573,7 @@ describe("package scan backfill", () => {
     );
   });
 
-  it("keeps a first malicious plugin release out of public package lists", async () => {
+  it("clears latest pointers when the first plugin release is malicious", async () => {
     vi.spyOn(Date, "now").mockReturnValue(1_700_000_000_000);
     const patch = vi.fn().mockResolvedValue(undefined);
     const candidateRelease = makeReleaseDoc({
@@ -19151,13 +19660,6 @@ describe("package scan backfill", () => {
         latestVersionSummary: undefined,
         scanStatus: "malicious",
         tags: {},
-      }),
-    );
-    expect(patch).toHaveBeenCalledWith(
-      "packageSearchDigest:demo",
-      expect.objectContaining({
-        latestVersion: undefined,
-        scanStatus: "malicious",
       }),
     );
   });
@@ -20338,7 +20840,7 @@ describe("softDeletePackageInternal", () => {
 });
 
 describe("restorePackageInternal", () => {
-  it("restores a soft-deleted package and writes ownerHandle to the search digest", async () => {
+  it("restores a soft-deleted package and records the audit event", async () => {
     const pkg = makePackageDoc({
       ownerUserId: "users:owner",
       ownerPublisherId: "publishers:owner-personal",
@@ -20378,12 +20880,6 @@ describe("restorePackageInternal", () => {
     expect(patch).toHaveBeenCalledWith(
       "packages:demo",
       expect.objectContaining({ softDeletedAt: undefined }),
-    );
-
-    // The packageSearchDigest row must be updated with ownerHandle resolved.
-    expect(patch).toHaveBeenCalledWith(
-      "packageSearchDigest:demo",
-      expect.objectContaining({ ownerHandle: "tongfei11", softDeletedAt: undefined }),
     );
 
     expect(insert).not.toHaveBeenCalledWith("packageCapabilitySearchDigest", expect.anything());

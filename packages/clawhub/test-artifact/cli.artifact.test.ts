@@ -112,7 +112,7 @@ function writeJson(response: ServerResponse, status: number, body: unknown) {
   response.end(JSON.stringify(body));
 }
 
-async function startLocalRegistry() {
+async function startLocalRegistry(catalogItems?: unknown[]) {
   const requests: RecordedRequest[] = [];
   const skillZip = zipSync({
     "SKILL.md": strToU8("# Demo\n\nA local registry fixture.\n"),
@@ -128,6 +128,11 @@ async function startLocalRegistry() {
     };
     if (bodyText) recorded.body = JSON.parse(bodyText) as unknown;
     requests.push(recorded);
+
+    if (request.method === "GET" && url.pathname === "/api/v1/skills" && catalogItems) {
+      writeJson(response, 200, { items: catalogItems, nextCursor: null });
+      return;
+    }
 
     if (request.method === "GET" && url.pathname === "/api/v1/whoami") {
       writeJson(response, 200, {
@@ -244,6 +249,47 @@ async function writeConfigWithToken(root: string, registry: string) {
 }
 
 describe("built CLI artifact", () => {
+  it("explores same-slug owners, null versions, and an older custom registry", async () => {
+    const item = {
+      slug: "shared-fixture",
+      displayName: "Fixture skill",
+      summary: null,
+      tags: {},
+      stats: {},
+      createdAt: 1,
+      updatedAt: 2,
+    };
+    const current = await startLocalRegistry([
+      {
+        ...item,
+        ownerHandle: "fixture-owner-a",
+        latestVersion: { version: "1.2.3+fixture.01", createdAt: 3, changelog: "Fixture" },
+      },
+      { ...item, ownerHandle: "fixture-owner-b", latestVersion: null },
+    ]);
+    const currentResult = await runNodeAsync([
+      binPath,
+      "--registry",
+      current.registry,
+      "--no-input",
+      "explore",
+    ]);
+    expect(currentResult.status).toBe(0);
+    expect(currentResult.stdout).toContain("fixture-owner-a/shared-fixture  v1.2.3+fixture.01");
+    expect(currentResult.stdout).toContain("fixture-owner-b/shared-fixture  v?");
+
+    const legacy = await startLocalRegistry([item]);
+    const legacyResult = await runNodeAsync([
+      binPath,
+      "--registry",
+      legacy.registry,
+      "--no-input",
+      "explore",
+    ]);
+    expect(legacyResult.status).toBe(0);
+    expect(legacyResult.stdout).toContain("shared-fixture  v?");
+  });
+
   it("resolves the package version from a flattened CLI artifact", async () => {
     const publishedRoot = await makeTmpDir("clawhub-artifact-version-");
     const flatDistDir = join(publishedRoot, "dist");

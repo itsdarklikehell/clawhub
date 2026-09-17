@@ -7,17 +7,17 @@ export declare const PLUGIN_CATEGORY_DEFINITIONS: readonly [{
     readonly slug: "channels";
     readonly label: "Channels";
     readonly icon: "message-circle";
-    readonly description: "Human-agent messaging transports and channel adapters. Choose this when the main purpose is letting people talk to the agent through a messaging service, even if the adapter also exposes workspace tools.";
+    readonly description: "Providing the main conversational transport between people and the agent through a messaging service, even if it also exposes workspace tools. Reply notifications, approval interfaces, inbox triage, and communication enhancements belong in Inbox & collaboration. A secondary channel capability does not override a different main purpose.";
 }, {
     readonly slug: "models";
     readonly label: "Models";
     readonly icon: "brain";
-    readonly description: "General model providers, inference backends, and model routing. Agent execution engines belong in Agent runtimes; specialized speech or media generators belong in Voice or Media when that is their main purpose.";
+    readonly description: "Providing inference backends, or selecting and routing which model/provider handles inference as the main service. The selected backend may execute the request. Incidental budget guards, usage reports, or optional fallback advice belong to their own workflow. Selecting and formatting tools for an existing model belongs in Context; specialized speech or media generators belong in Voice or Media.";
 }, {
     readonly slug: "agent-runtimes";
     readonly label: "Agent runtimes";
     readonly icon: "bot";
-    readonly description: "Agent execution engines and backends that run model/tool loops and manage native sessions, including Codex, ACP, and Copilot runtimes. Context assembly belongs in Context; coordinating work across agents belongs in Agent orchestration.";
+    readonly description: "Agent execution engines and backends that provide the agent model/tool loop and native session lifecycle, including Codex, ACP, and Copilot runtimes. A tool that invokes a separately running coding agent for a development task belongs in Developer tools; coordinating agents belongs in Agent orchestration.";
 }, {
     readonly slug: "memory";
     readonly label: "Memory";
@@ -27,7 +27,7 @@ export declare const PLUGIN_CATEGORY_DEFINITIONS: readonly [{
     readonly slug: "context";
     readonly label: "Context";
     readonly icon: "book-open";
-    readonly description: "Building, selecting, compacting, or managing the active conversation context. Durable memory belongs in Memory; an engine that runs the agent and owns its native sessions belongs in Agent runtimes.";
+    readonly description: "Building, selecting, compacting, or managing the active conversation context, including selecting and formatting the tools presented to the model. Durable memory belongs in Memory; an engine that runs the agent and owns its native sessions belongs in Agent runtimes.";
 }, {
     readonly slug: "voice";
     readonly label: "Voice";
@@ -52,7 +52,7 @@ export declare const PLUGIN_CATEGORY_DEFINITIONS: readonly [{
     readonly slug: "integrations";
     readonly label: "Integrations";
     readonly icon: "plug";
-    readonly description: "General connectors, API bridges, and service integration platforms without a more specific user purpose. A connector to a particular workflow belongs in that workflow's category; exposing tools or MCP is not enough.";
+    readonly description: "General-purpose platforms or reusable clients that let users choose which services, APIs, or MCP servers to connect. A fixed-service adapter belongs with its service's known workflow, or Other if that purpose is not established. Configuring credentials or an executable path does not make a fixed-service adapter general-purpose.";
 }, {
     readonly slug: "developer-tools";
     readonly label: "Developer tools";
@@ -72,12 +72,12 @@ export declare const PLUGIN_CATEGORY_DEFINITIONS: readonly [{
     readonly slug: "inbox-collaboration";
     readonly label: "Inbox & collaboration";
     readonly icon: "inbox";
-    readonly description: "Managing email, inboxes, team communication, and collaborative workspaces. Providing a transport for people to talk to the agent belongs in Channels.";
+    readonly description: "Managing email, inboxes, team communication, and collaborative workspaces, including reply notifications, message triage, and communication personas over existing channels. Providing the messaging transport itself belongs in Channels.";
 }, {
     readonly slug: "productivity";
     readonly label: "Productivity";
     readonly icon: "list-todo";
-    readonly description: "Managing tasks, notes, projects, plans, and personal or team work. Appointments and availability belong in Scheduling; document processing belongs in Documents & files.";
+    readonly description: "Managing tasks, notes, projects, plans, and personal or team work, including reviewing work activity and history. Appointments and availability belong in Scheduling; document processing belongs in Documents & files.";
 }, {
     readonly slug: "scheduling";
     readonly label: "Scheduling";
@@ -112,7 +112,7 @@ export declare const PLUGIN_CATEGORY_DEFINITIONS: readonly [{
     readonly slug: "other";
     readonly label: "Other";
     readonly icon: "package";
-    readonly description: "Use only when the plugin's main purpose does not fit another category or the available evidence is insufficient. Do not use this just because a plugin has several capabilities.";
+    readonly description: "Use only when the evidence does not establish a main purpose or that purpose does not reasonably fit any broader category. Category descriptions give examples, not exhaustive specialty lists; a missing exact specialty label or several capabilities is not a reason to use Other.";
 }];
 export declare const LEGACY_PLUGIN_CATEGORY_DEFINITIONS: readonly [{
     readonly slug: "tools";
