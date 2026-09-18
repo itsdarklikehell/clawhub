@@ -12,6 +12,10 @@ import {
   cmdUnhideSkill,
 } from "./cli/commands/delete.js";
 import { cmdInspect, cmdVerifySkill } from "./cli/commands/inspect.js";
+import {
+  cmdVerifyLocalSkill,
+  printLocalValidationResult,
+} from "./cli/commands/localVerify.js";
 import { cmdMergeSkill, cmdRenameSkill, cmdSetSkillTag } from "./cli/commands/ownership.js";
 import {
   cmdDeletePackage,
@@ -527,6 +531,25 @@ registerCommand(skill, ["skill", "verify"])
   .action(async (slug, options) => {
     const opts = await resolveGlobalOpts();
     await cmdVerifySkill(opts, slug, options);
+  });
+
+registerCommand(skill, ["skill", "verify:local"])
+  .description("Verify a local SKILL.md directory structure and content")
+  .argument("<path>", "Path to skill directory containing SKILL.md")
+  .option("--strict", "Treat warnings as errors")
+  .addOption(new Option("--json", "Output JSON").hideHelp())
+  .action(async (path, options) => {
+    const opts = await resolveGlobalOpts();
+    const result = await cmdVerifyLocalSkill(opts, path, {
+      json: options.json,
+      strict: options.strict,
+    });
+    if (options.json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      printLocalValidationResult(result);
+    }
+    process.exit(result.passed ? 0 : 1);
   });
 
 registerCommand(skill, ["skill", "tag"])

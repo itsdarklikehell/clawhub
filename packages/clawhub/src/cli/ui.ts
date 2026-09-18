@@ -155,6 +155,8 @@ const textStyles = {
   brand: "\x1b[1m\x1b[31m",
   strong: "\x1b[1m",
   muted: "\x1b[2m",
+  error: "\x1b[1m\x1b[31m",
+  warning: "\x1b[1m\x1b[33m",
 };
 
 export function styleText(value: string, style: keyof typeof textStyles) {

@@ -231,7 +231,6 @@ bun run coverage
 bun run lint
 ```
 
-
 ---
 
 ## 🎥 Gource Visualization
@@ -240,9 +239,10 @@ De ontwikkelhistorie van dit project in een film:
 
 <video src="https://raw.githubusercontent.com/itsdarklikehell/clawhub/main/gource-720p.mp4" controls width="100%"></video>
 
-*De video wordt automatisch gegenereerd door de [Gource workflow](.github/workflows/gource.yml) bij elke push.*
+_De video wordt automatisch gegenereerd door de [Gource workflow](.github/workflows/gource.yml) bij elke push._
 
 Lokale video genereren (volledige history, 1080p 30fps):
+
 ```bash
 gource --max-files 1500 --key -1920x1080 \
   --highlight-users --filename-time 3 --output-framerate 30 \
@@ -260,6 +260,7 @@ ffmpeg -y -i gource.mp4 -c:v libx264 -crf 20 -preset medium \
 ```
 
 CI-workflow (wakker bij elke push):
+
 ```yaml
 name: Gource visualization
 on:
@@ -280,7 +281,7 @@ jobs:
           gource_resolution: 1080p
           gource_fps: 60
           gource_filename_time: 3
-          gource_hide_items: 'mouse,date,filenames'
+          gource_hide_items: "mouse,date,filenames"
           gource_max_files: 1500
           gource_highlight_users: true
           gource_output_framerate: 30
