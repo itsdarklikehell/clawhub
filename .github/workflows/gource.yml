@@ -50,6 +50,13 @@ jobs:
             -movflags +faststart \
             ./gource.mp4
 
+      - name: Downscale to 720p for GitHub README embed
+        run: |
+          ffmpeg -y -i ./gource.mp4 \
+            -c:v libx264 -crf 20 -preset medium \
+            -vf "scale=-1:720" -c:a aac -b:a 192k \
+            gource-720p.mp4
+
       - name: Upload gource video
         uses: actions/upload-artifact@v4
         with:
@@ -61,6 +68,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add gource.mp4 || true
+          git add gource.mp4 gource-720p.mp4 || true
           git diff --staged --quiet || git commit -m "ci: update gource visualization (automated)"
           git push
