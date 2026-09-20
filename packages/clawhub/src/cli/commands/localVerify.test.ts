@@ -1,8 +1,8 @@
 import { mkdtemp, mkdir, writeFile, rm } from "fs/promises";
-import { join } from "path";
 import { tmpdir } from "os";
+import { join } from "path";
 import { describe, expect, it } from "vitest";
-import type { GlobalOpts } from "../../types.js";
+import type { GlobalOpts } from "../types.js";
 import { cmdVerifyLocalSkill } from "./localVerify.js";
 
 const mockOpts: GlobalOpts = {

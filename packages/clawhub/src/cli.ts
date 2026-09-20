@@ -12,10 +12,7 @@ import {
   cmdUnhideSkill,
 } from "./cli/commands/delete.js";
 import { cmdInspect, cmdVerifySkill } from "./cli/commands/inspect.js";
-import {
-  cmdVerifyLocalSkill,
-  printLocalValidationResult,
-} from "./cli/commands/localVerify.js";
+import { cmdVerifyLocalSkill, printLocalValidationResult } from "./cli/commands/localVerify.js";
 import { cmdMergeSkill, cmdRenameSkill, cmdSetSkillTag } from "./cli/commands/ownership.js";
 import {
   cmdDeletePackage,

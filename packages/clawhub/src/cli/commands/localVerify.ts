@@ -1,16 +1,16 @@
 import { readFile, readdir, stat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { styleText } from "../ui.js";
 import type { GlobalOpts } from "../types.js";
+import { styleText } from "../ui.js";
 
-export type LocalSkillCheck = {
+type LocalSkillCheck = {
   file: string;
   passed: boolean;
   message: string;
   severity: "error" | "warning" | "info";
 };
 
-export type LocalSkillValidationResult = {
+type LocalSkillValidationResult = {
   path: string;
   skillMdExists: boolean;
   checks: LocalSkillCheck[];
@@ -21,15 +21,31 @@ export type LocalSkillValidationResult = {
 
 const REQUIRED_SECTIONS = [
   { name: "Name", pattern: /^#\s+(.+)$/m, description: "Skill naam (eerste H1)" },
-  { name: "Description", pattern: /^##\s+Description$/im, description: "Beschrijving van de skill" },
+  {
+    name: "Description",
+    pattern: /^##\s+Description$/im,
+    description: "Beschrijving van de skill",
+  },
   { name: "Usage", pattern: /^##\s+Usage$/im, description: "Gebruiksinstructies" },
   { name: "Examples", pattern: /^##\s+Examples$/im, description: "Voorbeelden van gebruik" },
 ];
 
 const OPTIONAL_SECTIONS = [
-  { name: "Installation", pattern: /^##\s+Installation$/im, description: "Installatie-instructies" },
-  { name: "Configuration", pattern: /^##\s+Configuration$/im, description: "Configuratiemogelijkheden" },
-  { name: "Troubleshooting", pattern: /^##\s+Troubleshooting$/im, description: "Problemen oplossen" },
+  {
+    name: "Installation",
+    pattern: /^##\s+Installation$/im,
+    description: "Installatie-instructies",
+  },
+  {
+    name: "Configuration",
+    pattern: /^##\s+Configuration$/im,
+    description: "Configuratiemogelijkheden",
+  },
+  {
+    name: "Troubleshooting",
+    pattern: /^##\s+Troubleshooting$/im,
+    description: "Problemen oplossen",
+  },
   { name: "Contributing", pattern: /^##\s+Contributing$/im, description: "Bijdrage-instructies" },
 ];
 
@@ -185,7 +201,7 @@ async function checkFileCount(directory: string): Promise<LocalSkillCheck | null
  * Valideer een lokale skill-directory op structuur en inhoud.
  */
 export async function cmdVerifyLocalSkill(
-  opts: GlobalOpts,
+  _opts: GlobalOpts,
   skillPath: string,
   options: { json?: boolean; strict?: boolean } = {},
 ): Promise<LocalSkillValidationResult> {
@@ -287,7 +303,7 @@ export function printLocalValidationResult(result: LocalSkillValidationResult): 
     `${styleText("┌─", "brand")} ${styleText("Local Skill Validation", "brand")} ${styleText("─".repeat(40), "muted")}`,
   );
   console.log(`${styleText("│", "brand")} ${styleText(result.path, "strong")}`);
-  console.log(`${styleText("│", "brand")}`);
+  console.log(styleText("│", "brand"));
 
   if (!result.skillMdExists) {
     console.log(`${styleText("│", "brand")} ${styleText("✗ SKILL.md not found", "error")}`);
@@ -297,15 +313,12 @@ export function printLocalValidationResult(result: LocalSkillValidationResult): 
 
   for (const check of result.checks) {
     const icon = check.passed ? "✓" : check.severity === "error" ? "✗" : "!";
-    const color =
-      check.passed ? "strong" : check.severity === "error" ? "error" : "warning";
+    const color = check.passed ? "strong" : check.severity === "error" ? "error" : "warning";
     const prefix = check.severity === "info" ? "  " : "";
-    console.log(
-      `${styleText("│", "brand")} ${prefix}${styleText(icon, color)} ${check.message}`,
-    );
+    console.log(`${styleText("│", "brand")} ${prefix}${styleText(icon, color)} ${check.message}`);
   }
 
-  console.log(`${styleText("│", "brand")}`);
+  console.log(styleText("│", "brand"));
   console.log(
     `${styleText("│", "brand")} ${styleText(
       `Errors: ${result.errors}`,
